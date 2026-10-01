@@ -33,10 +33,12 @@ A scan writes the plan to `~/.local/state/diskreap/plan.json`.
 Each category lists what is reclaimable now, plus skipped items with the reason:
 
 - **docker** — build cache older than 24h (1h when critical) and dangling images;
-  unused images older than 7d only when critical. Docker's figure is an upper
-  bound (it includes recent cache that is kept).
+  images no container uses (created 7d+ ago) only when critical. Sizes are
+  upper bounds: recent cache is kept and image layers may be shared.
 - **log** — `*.log` / `*.log.N` ≥ 500 MB (100 MB critical), unwritten for 24h,
   not open, not tracked by git → compressed with zstd (lossless).
+- **tmp** — your own entries directly under `/tmp`, `/var/tmp`, `$TMPDIR`,
+  untouched 7d (2d critical), not in use, and holding no socket/FIFO.
 - **build-output** — regenerable trees: `node_modules`, Cargo `target`, `build`
   (with a project marker), `.dart_tool`, `.gradle`, `.next`/`.nuxt`/…, Python
   virtualenvs (found by `pyvenv.cfg`, any name), `Pods`, tool caches. Only if
@@ -65,7 +67,7 @@ the biggest remaining items: tell the user; do not discard work.
 ```bash
 diskreap clean                         # dry run: exactly what would happen
 diskreap clean --apply                 # act on the plan (re-verifies each item first)
-diskreap clean --apply -c docker -c build-output   # only some categories
+diskreap clean --apply -c docker -c build-output   # only some categories (docker log tmp build-output cache worktree)
 ```
 
 The plan expires after 6h — rescan if needed. Every action is appended to

@@ -46,7 +46,8 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 
 | Category | What | Gate | Action |
 |---|---|---|---|
-| `docker` | build cache, dangling images (and unused images when critical) | age (24h / 1h) | `docker builder/image prune` |
+| `docker` | build cache, dangling images, and (critical only) images no container uses, created 7d+ ago | age (24h / 1h) | `docker builder/image prune`; `docker rmi` per unused tag (`image prune -a` silently skips tagged images on the containerd image store) |
+| `tmp` | user-owned entries directly under `/tmp`, `/var/tmp`, `$TMPDIR` | idle ≥ 7d (2d critical), not in use, no socket/FIFO inside (a tmux/ssh-agent rendezvous looks idle) | delete |
 | `log` | `*.log`, `*.log.N` ≥ 500 MB (100 MB critical) | unwritten 24h, not open, not tracked | zstd (lossless) |
 | `build-output` | `node_modules`, Cargo `target`, `build`†, `.dart_tool`, `.gradle`†, `.next`/`.nuxt`/`.svelte-kit`/`.angular`†, Python venvs (by `pyvenv.cfg`), `Pods`†, `.build`†, `.tox`, `.pytest_cache`, … | git-ignored, no tracked files, idle ≥ 3d (1d critical), project not in use, not referenced by a service | delete |
 | `cache` | pip, uv, npm, pnpm, yarn, bun, cargo, go, gradle, maven, pub, conda pkgs, Playwright, Puppeteer, Chrome/Chromium/Firefox, Hugging Face, ModelScope, torch, Android, Xcode, `~/Library/Caches` | last use (file atime) beyond the horizon; files held open are kept; the tool's own prune where one exists | prune |
@@ -65,7 +66,7 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 | low | < 15% or < 30 GiB | normal horizons |
 | critical | < 5% or < 10 GiB | shorter horizons (build/worktree 1d, logs 100 MB/6h, caches at 25% of their horizon, unused Docker images) |
 
-`auto` stops as soon as free space is back above max(20%, 40 GiB). It escalates in this order: Docker, logs, build output, caches, worktrees. It only runs the full scan if the quick plan wasn't enough.
+`auto` stops as soon as free space is back above max(20%, 40 GiB). It escalates in this order: Docker, logs, temp dirs, build output, caches, worktrees. It only runs the full scan if the quick plan wasn't enough.
 
 ## Install
 

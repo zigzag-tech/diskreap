@@ -49,7 +49,7 @@ enum Cmd {
     Clean {
         #[arg(long)]
         apply: bool,
-        /// Only these categories: docker, log, build-output, cache, worktree.
+        /// Only these categories: docker, log, tmp, build-output, cache, worktree.
         #[arg(long = "category", short = 'c')]
         categories: Vec<String>,
     },
@@ -255,6 +255,7 @@ fn print_plan(p: &Plan, verbose: bool) {
     for cat in [
         "docker",
         "log",
+        "tmp",
         "build-output",
         "cache",
         "worktree",

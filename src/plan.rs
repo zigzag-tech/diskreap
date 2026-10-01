@@ -46,6 +46,8 @@ pub struct Policy {
     pub log_idle_hours: i64,
     /// Percent of each cache's normal age horizon.
     pub cache_age_pct: i64,
+    /// Stale user-owned entries directly under /tmp, /var/tmp, $TMPDIR.
+    pub tmp_idle_days: i64,
     pub docker_until: String,
     pub docker_unused_images: bool,
 }
@@ -59,6 +61,7 @@ impl Policy {
                 log_min_bytes: 100 << 20,
                 log_idle_hours: 6,
                 cache_age_pct: 25,
+                tmp_idle_days: 2,
                 docker_until: "1h".into(),
                 docker_unused_images: true,
             },
@@ -68,6 +71,7 @@ impl Policy {
                 log_min_bytes: 500 << 20,
                 log_idle_hours: 24,
                 cache_age_pct: 100,
+                tmp_idle_days: 7,
                 docker_until: "24h".into(),
                 docker_unused_images: false,
             },
@@ -146,7 +150,7 @@ pub struct Ctx<'a> {
 /// Err(reason) = do not touch.
 pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
     let p = Path::new(&it.path);
-    if it.cat != "docker" && it.cat != "cache" {
+    if it.cat != "docker" && it.cat != "cache" && it.cat != "tmp" {
         if !p.starts_with(cx.home) || p == cx.home {
             return Err("outside $HOME".into());
         }
@@ -156,6 +160,24 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
     }
     let t = now();
     match it.cat.as_str() {
+        "tmp" => {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::symlink_metadata(p).map_err(|_| "gone")?;
+            if !tmp_roots().iter().any(|r| p.parent() == Some(r.as_path())) {
+                return Err("not directly under a temp dir".into());
+            }
+            if md.uid() != unsafe { libc::geteuid() } {
+                return Err("owned by another user".into());
+            }
+            if let Some(h) = cx.inuse.under(p) {
+                return Err(format!("in use ({})", h.display()));
+            }
+            let st = act::tree_stats(p);
+            if st.special {
+                return Err("holds a socket or FIFO (a live session's rendezvous)".into());
+            }
+            idle(t, st.newest, cx.policy.tmp_idle_days)
+        }
         "build-output" => {
             let top = git::toplevel(p.parent().unwrap_or(p)).ok_or("not inside a git repo")?;
             if let Some(h) = cx.inuse.under(&top) {
@@ -267,6 +289,17 @@ fn idle(t: i64, last: i64, days: i64) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// System and per-user temp dirs (on macOS $TMPDIR is a per-user /var/folders dir).
+pub fn tmp_roots() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = vec!["/tmp".into(), "/var/tmp".into(), std::env::temp_dir()];
+    v.iter_mut()
+        .for_each(|p| *p = std::fs::canonicalize(&*p).unwrap_or(p.clone()));
+    v.sort();
+    v.dedup();
+    v.retain(|p| p.is_dir());
+    v
 }
 
 pub fn expand(s: &str, home: &Path) -> String {
@@ -440,6 +473,17 @@ pub fn scan(o: &ScanOpts) -> Plan {
         );
         items.push(it);
     }
+    let mut tmps: Vec<Item> = Vec::new();
+    for root in tmp_roots() {
+        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let st = act::tree_stats(&e.path());
+            if st.bytes >= 10 << 20 {
+                tmps.push(item("tmp", &e.path(), st.bytes, st.newest));
+            }
+        }
+    }
+    items.extend(verdicts(tmps, &cx));
+
     for (rel, why) in REPORT_ONLY {
         let p = home.join(rel);
         if p.is_dir() {
