@@ -58,13 +58,19 @@ if [ "$hook" = 1 ]; then
   settings="$HOME/.claude/settings.json"
   command -v jq >/dev/null || { echo "jq is required for --claude-hook" >&2; exit 1; }
   [ -f "$settings" ] || echo '{}' > "$settings"
-  cmd="$bin status --hook"
-  if jq -e --arg c "$cmd" '[.hooks.SessionStart[]?.hooks[]?.command] | index($c)' "$settings" >/dev/null; then
-    echo "Claude Code hook already present"
-  else
-    tmp="$(mktemp)"
-    jq --arg c "$cmd" '.hooks.SessionStart = ((.hooks.SessionStart // []) + [{"hooks":[{"type":"command","command":$c,"timeout":5}]}])' \
-      "$settings" > "$tmp" && cat "$tmp" > "$settings" && rm -f "$tmp"
-    echo "added Claude Code SessionStart hook: $cmd"
-  fi
+  # Literal $HOME (the hook runs in a shell): one settings.json can serve
+  # machines whose homes differ (/home/x vs /Users/x). Never fail a session.
+  hbin="$bin"
+  case "$bin" in "$HOME"/*) hbin="\$HOME/${bin#"$HOME"/}" ;; esac
+  cmd="\"$hbin\" status --hook 2>/dev/null || true"
+  tmp="$(mktemp)"
+  # Replace any earlier diskreap hook (older path/format), then add ours once.
+  jq --arg c "$cmd" '
+    .hooks.SessionStart = (
+      [(.hooks.SessionStart // [])[]
+        | .hooks = [.hooks[]? | select((.command // "") | contains("diskreap status --hook") | not)]
+        | select(.hooks | length > 0)]
+      + [{"hooks":[{"type":"command","command":$c,"timeout":5}]}])' \
+    "$settings" > "$tmp" && cat "$tmp" > "$settings" && rm -f "$tmp"
+  echo "Claude Code SessionStart hook: $cmd"
 fi
