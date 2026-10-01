@@ -8,9 +8,9 @@
 //! - In "discovery" mode (quick scan) it only reads directory entries — no stat —
 //!   except inside classified candidates, which are sized fully.
 
+use crate::platform;
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
@@ -158,7 +158,7 @@ pub fn walk(opts: Opts, cls: Box<dyn Classify>) -> WalkResult {
         cv: Condvar::new(),
         cls,
         skip: opts.skip.into_iter().collect(),
-        root_dev: root_md.dev(),
+        root_dev: platform::dev(&root_md),
         size_all: opts.size_all,
         report_depth: opts.report_depth,
         max_depth: opts.max_depth,
@@ -373,13 +373,13 @@ fn process(sh: &Shared, item: Item) {
             }
             if csizing {
                 match fs::symlink_metadata(&path) {
-                    Ok(m) if m.dev() != sh.root_dev => {
+                    Ok(m) if platform::dev(&m) != sh.root_dev => {
                         sh.out.lock().unwrap().skipped.push(path);
                         continue;
                     }
                     Ok(m) => caccs
                         .iter()
-                        .for_each(|a| a.add(m.blocks() * 512, m.mtime())),
+                        .for_each(|a| a.add(platform::alloc(&m), platform::mtime(&m))),
                     Err(_) => {
                         sh.errors.fetch_add(1, Relaxed);
                         continue;
@@ -407,9 +407,9 @@ fn process(sh: &Shared, item: Item) {
             };
             if sizing {
                 let counted =
-                    m.nlink() <= 1 || sh.inodes.lock().unwrap().insert((m.dev(), m.ino()));
-                let b = if counted { m.blocks() * 512 } else { 0 };
-                accs.iter().for_each(|a| a.add(b, m.mtime()));
+                    platform::hardlink_key(&m).is_none_or(|k| sh.inodes.lock().unwrap().insert(k));
+                let b = if counted { platform::alloc(&m) } else { 0 };
+                accs.iter().for_each(|a| a.add(b, platform::mtime(&m)));
             }
             if detect
                 && ft.is_file()
@@ -419,7 +419,7 @@ fn process(sh: &Shared, item: Item) {
                 sh.out.lock().unwrap().files.push(FileHit {
                     path,
                     size: m.len(),
-                    mtime: m.mtime(),
+                    mtime: platform::mtime(&m),
                 });
             }
         }

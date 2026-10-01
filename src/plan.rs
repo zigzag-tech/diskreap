@@ -23,19 +23,29 @@ pub enum Level {
 }
 
 /// Low: free < 15% or < 30 GiB. Critical: free < 5% or < 10 GiB.
+/// Thresholds are a share of the disk clamped to absolute bounds: a bare
+/// percentage cries wolf on a 1.8 TB disk with 270 GB free, and a bare
+/// absolute floor cries wolf on a 30 GB VM that is 50% free (both seen in the
+/// first fleet scan).
+fn clamp_share(total: u64, pct: u64, lo: u64, hi: u64) -> u64 {
+    (total * pct / 100).clamp(lo, hi)
+}
+
+/// Low: free < 15% of the disk clamped to [10, 100] GiB.
+/// Critical: free < 5% clamped to [3, 30] GiB.
 pub fn level_of(total: u64, avail: u64) -> Level {
-    if avail * 100 < total * 5 || avail < 10 * GB {
+    if avail < clamp_share(total, 5, 3 * GB, 30 * GB) {
         Level::Critical
-    } else if avail * 100 < total * 15 || avail < 30 * GB {
+    } else if avail < clamp_share(total, 15, 10 * GB, 100 * GB) {
         Level::Low
     } else {
         Level::Ok
     }
 }
 
-/// `auto` stops once free space is back above this.
+/// `auto` stops once free space is back above this: 20% clamped to [15, 150] GiB.
 pub fn target_avail(total: u64) -> u64 {
-    (total / 5).max(40 * GB)
+    clamp_share(total, 20, 15 * GB, 150 * GB)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -65,7 +75,18 @@ impl Policy {
                 docker_until: "1h".into(),
                 docker_unused_images: true,
             },
-            _ => Policy {
+            // Daily maintenance while space is fine: only what is clearly stale.
+            Level::Ok => Policy {
+                build_idle_days: 14,
+                worktree_idle_days: 7,
+                log_min_bytes: 1 << 30,
+                log_idle_hours: 7 * 24,
+                cache_age_pct: 200,
+                tmp_idle_days: 14,
+                docker_until: "168h".into(),
+                docker_unused_images: false,
+            },
+            Level::Low => Policy {
                 build_idle_days: 3,
                 worktree_idle_days: 3,
                 log_min_bytes: 500 << 20,
@@ -161,12 +182,11 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
     let t = now();
     match it.cat.as_str() {
         "tmp" => {
-            use std::os::unix::fs::MetadataExt;
             let md = std::fs::symlink_metadata(p).map_err(|_| "gone")?;
             if !tmp_roots().iter().any(|r| p.parent() == Some(r.as_path())) {
                 return Err("not directly under a temp dir".into());
             }
-            if md.uid() != unsafe { libc::geteuid() } {
+            if !crate::platform::owned_by_me(&md) {
                 return Err("owned by another user".into());
             }
             if let Some(h) = cx.inuse.under(p) {
@@ -246,9 +266,9 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             if md.len() < cx.policy.log_min_bytes {
                 return Err(format!("< {}", util::human(cx.policy.log_min_bytes)));
             }
-            use std::os::unix::fs::MetadataExt;
-            if t - md.mtime() < cx.policy.log_idle_hours * 3600 {
-                return Err(format!("written {} ago", util::ago(md.mtime())));
+            let mt = crate::platform::mtime(&md);
+            if t - mt < cx.policy.log_idle_hours * 3600 {
+                return Err(format!("written {} ago", util::ago(mt)));
             }
             if let Some(top) = git::toplevel(p.parent().unwrap_or(p)) {
                 if git::tracked(&top, p) {
@@ -294,8 +314,7 @@ fn idle(t: i64, last: i64, days: i64) -> Result<(), String> {
 /// System and per-user temp dirs (on macOS $TMPDIR is a per-user /var/folders dir).
 pub fn tmp_roots() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = vec!["/tmp".into(), "/var/tmp".into(), std::env::temp_dir()];
-    v.iter_mut()
-        .for_each(|p| *p = std::fs::canonicalize(&*p).unwrap_or(p.clone()));
+    v.iter_mut().for_each(|p| *p = crate::platform::canon(p));
     v.sort();
     v.dedup();
     v.retain(|p| p.is_dir());
@@ -320,7 +339,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
     let started = Instant::now();
     let home = util::home();
     let root = o.root.clone().unwrap_or_else(|| home.clone());
-    let policy = Policy::for_level(o.level.max(Level::Low));
+    let policy = Policy::for_level(o.level);
     let mounts = mounts::list();
     let (total, avail) = fs_space(&home).unwrap_or((0, 0));
 
@@ -605,12 +624,16 @@ mod tests {
 
     #[test]
     fn levels() {
-        let t = 1000 * GB;
-        assert_eq!(level_of(t, 300 * GB), Level::Ok);
-        assert_eq!(level_of(t, 100 * GB), Level::Low);
-        assert_eq!(level_of(t, 40 * GB), Level::Critical);
-        assert_eq!(level_of(100 * GB, 25 * GB), Level::Low); // < 30 GiB absolute
-        assert_eq!(target_avail(t), 200 * GB);
+        let t = 1800 * GB; // big disk: 15% would be 270 GiB — capped at 100
+        assert_eq!(level_of(t, 270 * GB), Level::Ok);
+        assert_eq!(level_of(t, 99 * GB), Level::Low);
+        assert_eq!(level_of(t, 29 * GB), Level::Critical);
+        assert_eq!(target_avail(t), 150 * GB);
+        let small = 30 * GB; // small VM: 50% free is fine
+        assert_eq!(level_of(small, 15 * GB), Level::Ok);
+        assert_eq!(level_of(small, 9 * GB), Level::Low);
+        assert_eq!(level_of(small, 2 * GB), Level::Critical);
+        assert_eq!(level_of(400 * GB, 39 * GB), Level::Low); // 15% = 60 GiB
     }
 
     #[test]

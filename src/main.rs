@@ -2,6 +2,7 @@ mod act;
 mod git;
 mod mounts;
 mod plan;
+mod platform;
 mod procs;
 mod rules;
 mod util;
@@ -30,6 +31,8 @@ enum Cmd {
     Status {
         #[arg(long)]
         hook: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Stage 1: find what can be reclaimed, write the plan. Quick by default.
     Scan {
@@ -52,15 +55,31 @@ enum Cmd {
         /// Only these categories: docker, log, tmp, build-output, cache, worktree.
         #[arg(long = "category", short = 'c')]
         categories: Vec<String>,
+        /// Print one JSON result (actions, estimates, measured df gain).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove ONE report-only path a human approved (supervised mode). Keeps the
+    /// safety floor: inside $HOME, not a repository, not in use, not referenced.
+    Reap {
+        path: PathBuf,
+        /// Who approved it and why (recorded in the audit log).
+        #[arg(long)]
+        approval: String,
+        #[arg(long)]
+        json: bool,
     },
     /// Timer entry point: if free space is low, quick scan + clean until the
     /// target is reached, escalating to a full scan if needed.
     Auto {
         #[arg(long)]
         dry_run: bool,
-        /// Act even when space is fine (uses the `low` policy).
+        /// Act even when space is fine (uses the current level's policy).
         #[arg(long)]
         force: bool,
+        /// Act only at this pressure level or worse (the local guard uses `critical`).
+        #[arg(long, default_value = "low")]
+        min_level: Level,
     },
     /// Hang-proof `du`: sizes of PATH's subdirectories, skipping other mounts.
     Du {
@@ -75,12 +94,12 @@ enum Cmd {
 const THREADS: usize = 32;
 
 fn main() {
-    if unsafe { libc::geteuid() } == 0 && std::env::var_os("DISKREAP_ALLOW_ROOT").is_none() {
+    if platform::is_privileged() && std::env::var_os("DISKREAP_ALLOW_ROOT").is_none() {
         eprintln!("diskreap: refusing to run as root (it cleans the invoking user's files)");
         std::process::exit(2);
     }
     match Cli::parse().cmd {
-        Cmd::Status { hook } => status(hook),
+        Cmd::Status { hook, json } => status(hook, json),
         Cmd::Scan {
             full,
             level,
@@ -102,7 +121,11 @@ fn main() {
                 print_plan(&plan, verbose);
             }
         }
-        Cmd::Clean { apply, categories } => {
+        Cmd::Clean {
+            apply,
+            categories,
+            json,
+        } => {
             let _lock = lock_or_exit("clean.lock");
             let Some(plan) = Plan::load() else {
                 eprintln!("no plan yet — run `diskreap scan` first");
@@ -115,21 +138,57 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            let freed = act::apply(
+            let r = act::apply(
                 &plan,
                 &act::ApplyOpts {
                     apply,
                     categories: &categories,
                     until_avail: None,
+                    quiet: json,
                 },
             );
-            println!(
-                "{} {}",
-                if apply { "freed" } else { "would free ~" },
-                human(freed)
-            );
+            if json {
+                println!("{}", serde_json::to_string(&r).unwrap());
+            } else if apply {
+                println!(
+                    "freed {} (df; estimate {})",
+                    human(r.freed_df_bytes),
+                    human(r.est_bytes)
+                );
+            } else {
+                println!("would free ~{}", human(r.est_bytes));
+            }
         }
-        Cmd::Auto { dry_run, force } => auto(dry_run, force),
+        Cmd::Reap {
+            path,
+            approval,
+            json,
+        } => {
+            let _lock = lock_or_exit("clean.lock");
+            let r = act::reap_approved(&path, &approval);
+            if json {
+                println!(
+                    "{}",
+                    match &r {
+                        Ok(b) => serde_json::json!({"path": path, "ok": true, "freed_df_bytes": b}),
+                        Err(e) => serde_json::json!({"path": path, "ok": false, "reason": e}),
+                    }
+                );
+            } else {
+                match &r {
+                    Ok(b) => println!("removed {} (freed {})", path.display(), human(*b)),
+                    Err(e) => eprintln!("refused {}: {e}", path.display()),
+                }
+            }
+            if r.is_err() {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Auto {
+            dry_run,
+            force,
+            min_level,
+        } => auto(dry_run, force, min_level),
         Cmd::Du { path, depth, top } => du(path.unwrap_or_else(home), depth, top),
     }
 }
@@ -146,10 +205,20 @@ fn current_level() -> Level {
     level_of(t, a)
 }
 
-fn status(hook: bool) {
+fn status(hook: bool, json: bool) {
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
     let lvl = level_of(t, a);
     let pct = if t > 0 { a * 100 / t } else { 0 };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "host": util::hostname(), "home": home(), "total_bytes": t, "avail_bytes": a,
+                "level": lvl, "target_avail_bytes": target_avail(t), "version": env!("CARGO_PKG_VERSION"),
+            })
+        );
+        return;
+    }
     if hook {
         if lvl != Level::Ok {
             println!(
@@ -181,7 +250,7 @@ fn status(hook: bool) {
     }
 }
 
-fn auto(dry_run: bool, force: bool) {
+fn auto(dry_run: bool, force: bool, min_level: Level) {
     let _lock = lock_or_exit("auto.lock");
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
     let lvl = level_of(t, a);
@@ -192,14 +261,14 @@ fn auto(dry_run: bool, force: bool) {
         human(a),
         lvl
     );
-    if lvl == Level::Ok && !force {
+    if lvl < min_level.max(Level::Low) && !force {
         return;
     }
     let target = target_avail(t);
     for full in [false, true] {
         let plan = plan::scan(&ScanOpts {
             full,
-            level: lvl.max(Level::Low),
+            level: lvl,
             root: None,
             threads: THREADS,
         });
@@ -210,14 +279,20 @@ fn auto(dry_run: bool, force: bool) {
             plan.scan_secs,
             human(plan.reclaimable())
         );
-        let freed = act::apply(
+        let r = act::apply(
             &plan,
             &act::ApplyOpts {
                 apply: !dry_run,
                 categories: &[],
                 until_avail: Some(target),
+                quiet: false,
             },
         );
+        let freed = if dry_run {
+            r.est_bytes
+        } else {
+            r.freed_df_bytes
+        };
         println!(
             "{} {}",
             if dry_run { "would free ~" } else { "freed" },

@@ -15,7 +15,11 @@ pub struct Mount {
 }
 
 pub fn list() -> Vec<Mount> {
-    if cfg!(target_os = "linux") {
+    if cfg!(windows) {
+        // No mount table to read: the walker never follows junctions or
+        // mounted folders (they are reparse points), and drives are separate roots.
+        Vec::new()
+    } else if cfg!(target_os = "linux") {
         parse_mountinfo(&std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default())
     } else {
         run(&["/sbin/mount"], None, Duration::from_secs(10))

@@ -1,6 +1,4 @@
-use std::ffi::CString;
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,34 +90,31 @@ pub fn run(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Option<Out> 
 pub fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|d| d.join(bin))
+        .flat_map(|d| {
+            let exts: &[&str] = if cfg!(windows) {
+                &["", ".exe", ".cmd", ".bat"]
+            } else {
+                &[""]
+            };
+            exts.iter()
+                .map(move |e| d.join(format!("{bin}{e}")))
+                .collect::<Vec<_>>()
+        })
         .find(|p| p.is_file())
 }
 
-/// (total, available-to-user) bytes of the filesystem holding `p`. statvfs on a
-/// local path never touches other mounts, so this is safe even with dead mounts.
-#[allow(clippy::unnecessary_cast)] // statvfs field types differ across platforms
+/// (total, available-to-user) bytes of the filesystem holding `p` — statvfs /
+/// GetDiskFreeSpaceEx on a local path never touches other mounts.
 pub fn fs_space(p: &Path) -> Option<(u64, u64)> {
-    let c = CString::new(p.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return None;
-    }
-    let f = s.f_frsize as u64;
-    Some((s.f_blocks as u64 * f, s.f_bavail as u64 * f))
+    crate::platform::fs_space(p)
 }
 
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
-        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        return String::from_utf8_lossy(&buf[..n]).into_owned();
-    }
-    "unknown".into()
+    crate::platform::hostname()
 }
 
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("HOME not set"))
+    crate::platform::home()
 }
 
 pub fn state_dir() -> PathBuf {
@@ -132,21 +127,17 @@ pub fn state_dir() -> PathBuf {
 
 /// Exclusive non-blocking lock held for the life of the returned file.
 pub fn try_lock(name: &str) -> Option<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(state_dir().join(name))
         .ok()?;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        Some(f)
-    } else {
-        None
-    }
+    f.try_lock().ok().map(|_| f)
 }
 
 pub fn mtime_of(p: &Path) -> i64 {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::symlink_metadata(p).map(|m| m.mtime()).unwrap_or(0)
+    std::fs::symlink_metadata(p)
+        .map(|m| crate::platform::mtime(&m))
+        .unwrap_or(0)
 }

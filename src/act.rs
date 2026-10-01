@@ -5,12 +5,12 @@
 use crate::git;
 use crate::mounts::{self, Mount};
 use crate::plan::{self, Ctx, Item, Plan};
+use crate::platform;
 use crate::procs::{InUse, Refs};
 use crate::util::{self, fs_space, human, now, run, which, DAY};
 use crate::walk::{self, Opts};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -46,36 +46,28 @@ pub fn du(p: &Path, mounts: &[Mount]) -> u64 {
     .total
 }
 
-/// rm -rf that stays on one filesystem, never follows symlinks, and copes with
-/// read-only trees (sealed release copies are chmod a-w): it restores u+rwx on
-/// directories it is about to empty — never sudo.
+/// rm -rf that stays on one filesystem, never follows symlinks/junctions, and
+/// copes with read-only trees (sealed release copies are chmod a-w; Windows
+/// read-only attributes) by making each entry removable first — never sudo.
 pub fn remove_tree(p: &Path) -> std::io::Result<()> {
     let md = fs::symlink_metadata(p)?;
     if let Some(parent) = p.parent() {
-        ensure_owner_rwx(parent)?;
+        platform::make_removable(parent, &fs::symlink_metadata(parent)?)?;
     }
-    rm_rec(p, md.dev(), &md)
-}
-
-fn ensure_owner_rwx(d: &Path) -> std::io::Result<()> {
-    let m = fs::symlink_metadata(d)?;
-    if m.is_dir() && m.mode() & 0o700 != 0o700 {
-        fs::set_permissions(d, fs::Permissions::from_mode(m.mode() | 0o700))?;
-    }
-    Ok(())
+    rm_rec(p, platform::dev(&md), &md)
 }
 
 fn rm_rec(p: &Path, dev: u64, md: &fs::Metadata) -> std::io::Result<()> {
+    platform::make_removable(p, md)?;
     if !md.is_dir() {
         return fs::remove_file(p);
     }
-    if md.dev() != dev {
+    if platform::dev(md) != dev {
         return Err(std::io::Error::other(format!(
             "{} is another filesystem",
             p.display()
         )));
     }
-    ensure_owner_rwx(p)?;
     for e in fs::read_dir(p)? {
         let e = e?;
         let cm = fs::symlink_metadata(e.path())?;
@@ -93,7 +85,6 @@ pub struct TreeStats {
 
 /// Sequential stats of one modest tree (temp entries), staying on its filesystem.
 pub fn tree_stats(p: &Path) -> TreeStats {
-    use std::os::unix::fs::FileTypeExt;
     let mut st = TreeStats {
         bytes: 0,
         newest: 0,
@@ -102,17 +93,16 @@ pub fn tree_stats(p: &Path) -> TreeStats {
     let Ok(m) = fs::symlink_metadata(p) else {
         return st;
     };
-    let dev = m.dev();
+    let dev = platform::dev(&m);
     let mut stack = vec![p.to_path_buf()];
     while let Some(q) = stack.pop() {
         let Ok(m) = fs::symlink_metadata(&q) else {
             continue;
         };
-        st.bytes += m.blocks() * 512;
-        st.newest = st.newest.max(m.mtime());
-        let ft = m.file_type();
-        st.special |= ft.is_socket() || ft.is_fifo();
-        if m.is_dir() && m.dev() == dev {
+        st.bytes += platform::alloc(&m);
+        st.newest = st.newest.max(platform::mtime(&m));
+        st.special |= platform::is_special(&m.file_type());
+        if m.is_dir() && platform::dev(&m) == dev {
             stack.extend(
                 fs::read_dir(&q)
                     .into_iter()
@@ -148,7 +138,7 @@ pub fn cache_pass(it: &Item, cx: &Ctx, delete: bool) -> CacheResult {
     }
     let cutoff = now() - c.days * DAY;
     let root_dev = match fs::symlink_metadata(dir) {
-        Ok(m) => m.dev(),
+        Ok(m) => platform::dev(&m),
         Err(_) => return r,
     };
     if c.strat == "age-files" {
@@ -160,16 +150,16 @@ pub fn cache_pass(it: &Item, cx: &Ctx, delete: bool) -> CacheResult {
                     continue;
                 };
                 if m.is_dir() {
-                    if m.dev() == root_dev {
+                    if platform::dev(&m) == root_dev {
                         stack.push(e.path());
                     }
                     continue;
                 }
-                let b = m.blocks() * 512;
+                let b = platform::alloc(&m);
                 r.total += b;
-                if m.atime().max(m.mtime()) < cutoff
+                if platform::last_use(&m) < cutoff
                     && cx.inuse.under(&e.path()).is_none()
-                    && (!delete || fs::remove_file(e.path()).is_ok())
+                    && (!delete || remove_tree(&e.path()).is_ok())
                 {
                     r.bytes += b;
                 }
@@ -205,21 +195,15 @@ pub fn cache_pass(it: &Item, cx: &Ctx, delete: bool) -> CacheResult {
     r
 }
 
-/// (allocated bytes, newest max(atime, mtime)) of a tree — caches are local and
+/// (allocated bytes, newest last use) of a tree — caches are local and
 /// modest, so a sequential pass is fine here.
 fn tree_usage(p: &Path, dev: u64) -> (u64, i64) {
     let Ok(m) = fs::symlink_metadata(p) else {
         return (0, i64::MAX);
     };
-    let mut b = m.blocks() * 512;
-    // Directory atime moves whenever anything lists it (including this scan):
-    // only a FILE's atime means "used".
-    let mut used = if m.is_dir() {
-        m.mtime()
-    } else {
-        m.atime().max(m.mtime())
-    };
-    if m.is_dir() && m.dev() == dev {
+    let mut b = platform::alloc(&m);
+    let mut used = platform::last_use(&m);
+    if m.is_dir() && platform::dev(&m) == dev {
         if let Ok(rd) = fs::read_dir(p) {
             for e in rd.flatten() {
                 let (cb, cu) = tree_usage(&e.path(), dev);
@@ -397,10 +381,35 @@ pub struct ApplyOpts<'a> {
     pub categories: &'a [String],
     /// Stop once this much is free (auto mode).
     pub until_avail: Option<u64>,
+    /// Machine-readable mode: no human lines on stdout.
+    pub quiet: bool,
 }
 
-/// Returns bytes freed (measured by statvfs when applying).
-pub fn apply(plan: &Plan, o: &ApplyOpts) -> u64 {
+#[derive(serde::Serialize, Default)]
+pub struct ApplyResult {
+    pub applied: bool,
+    /// Measured by df (0 for a dry run).
+    pub freed_df_bytes: u64,
+    /// Sum of the acted-on items' logical estimates.
+    pub est_bytes: u64,
+    pub target_reached: bool,
+    pub actions: Vec<ActionRecord>,
+}
+
+#[derive(serde::Serialize, Clone)]
+pub struct ActionRecord {
+    pub cat: String,
+    pub path: String,
+    /// delete | compress | remove-worktree | docker-prune | prune-cache | skip
+    pub action: String,
+    pub est_bytes: u64,
+    pub ok: bool,
+    /// Why it was skipped at apply time, or "FAILED".
+    pub note: String,
+}
+
+/// Act on every ok item, re-checking each one first.
+pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
     let home = Path::new(&plan.home).to_path_buf();
     let mounts = mounts::list();
     let inuse = InUse::snapshot();
@@ -414,8 +423,41 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> u64 {
     };
     let avail = || fs_space(&home).map(|s| s.1).unwrap_or(0);
     let start_avail = avail();
-    let mut est = 0u64;
+    let mut res = ApplyResult {
+        applied: o.apply,
+        ..Default::default()
+    };
     let verb = if o.apply { "" } else { "would " };
+    let record =
+        |res: &mut ApplyResult, it: &Item, action: &str, est: u64, ok: bool, note: &str| {
+            if !o.quiet {
+                if action == "skip" {
+                    println!("  skip    {:<12} {}  ({note})", it.cat, it.path);
+                } else {
+                    println!(
+                        "  {verb}{action:<8} {:<12} {}  ({}){}",
+                        it.cat,
+                        it.path,
+                        human(est),
+                        if ok { "" } else { "  FAILED" }
+                    );
+                }
+            }
+            if o.apply || action == "skip" {
+                log(it, action, note, if ok { est } else { 0 });
+            }
+            if ok && action != "skip" {
+                res.est_bytes += est;
+            }
+            res.actions.push(ActionRecord {
+                cat: it.cat.clone(),
+                path: it.path.clone(),
+                action: action.into(),
+                est_bytes: est,
+                ok,
+                note: note.into(),
+            });
+        };
     'run: for cat in ORDER {
         if !o.categories.is_empty() && !o.categories.iter().any(|c| c == cat) {
             continue;
@@ -423,74 +465,91 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> u64 {
         for it in plan.items.iter().filter(|i| i.ok && i.cat == *cat) {
             if let Some(t) = o.until_avail {
                 if o.apply && avail() >= t {
-                    println!("target reached: {} free", human(avail()));
+                    if !o.quiet {
+                        println!("target reached: {} free", human(avail()));
+                    }
+                    res.target_reached = true;
                     break 'run;
                 }
             }
             if let Err(why) = plan::check(it, &cx) {
-                println!("  skip    {:<12} {}  ({why})", it.cat, it.path);
-                log(it, "skip", &why, 0);
+                record(&mut res, it, "skip", 0, false, &why);
                 continue;
             }
-            let (action, done) = match it.cat.as_str() {
-                "build-output" => (
-                    "delete",
-                    !o.apply || remove_tree(Path::new(&it.path)).is_ok(),
+            let p = Path::new(&it.path);
+            let (action, est, ok) = match it.cat.as_str() {
+                "build-output" | "tmp" => ("delete", it.bytes, !o.apply || remove_tree(p).is_ok()),
+                "log" => ("compress", it.bytes, !o.apply || compress(p)),
+                "worktree" => ("remove-worktree", it.bytes, !o.apply || remove_wt(p)),
+                "docker" => (
+                    "docker-prune",
+                    it.bytes,
+                    !o.apply || docker_clean(&plan.policy),
                 ),
-                "log" => ("compress", !o.apply || compress(Path::new(&it.path))),
-                "tmp" => (
-                    "delete",
-                    !o.apply || remove_tree(Path::new(&it.path)).is_ok(),
-                ),
-                "worktree" => (
-                    "remove-worktree",
-                    !o.apply || remove_wt(Path::new(&it.path)),
-                ),
-                "docker" => ("docker-prune", !o.apply || docker_clean(&plan.policy)),
-                "cache" => {
-                    if o.apply {
-                        let r = cache_pass(it, &cx, true);
-                        println!("  pruned  cache        {}  ({})", it.path, human(r.bytes));
-                        log(it, "prune-cache", "", r.bytes);
-                        est += r.bytes;
-                        continue;
-                    }
-                    ("prune-cache", true)
-                }
+                "cache" if o.apply => ("prune-cache", cache_pass(it, &cx, true).bytes, true),
+                "cache" => ("prune-cache", it.bytes, true),
                 _ => continue,
             };
-            println!(
-                "  {verb}{action:<8} {:<12} {}  ({})",
-                it.cat,
-                it.path,
-                human(it.bytes)
+            record(
+                &mut res,
+                it,
+                action,
+                est,
+                ok,
+                if ok { "" } else { "FAILED" },
             );
-            if o.apply {
-                log(
-                    it,
-                    action,
-                    if done { "" } else { "FAILED" },
-                    if done { it.bytes } else { 0 },
-                );
-            }
-            if done {
-                est += it.bytes;
-            }
         }
     }
     if !o.apply {
-        return est;
+        return res;
     }
     // Per-item sizes are logical estimates (compressed filesystems, shared
     // image layers, hard links); the df delta is what was actually gained —
     // and on btrfs/ZFS it keeps growing for a while as space is released.
-    let freed = avail().saturating_sub(start_avail);
-    let line = serde_json::json!({
+    res.freed_df_bytes = avail().saturating_sub(start_avail);
+    append_log(&serde_json::json!({
         "t": now(), "host": util::hostname(), "action": "run-summary",
-        "est_bytes": est, "freed_df_bytes": freed,
-    });
-    append_log(&line);
-    freed
+        "est_bytes": res.est_bytes, "freed_df_bytes": res.freed_df_bytes,
+    }));
+    res
+}
+
+/// A human-approved removal of one report-only path (stage 2 of supervised
+/// mode). The approval replaces the category rules, not the safety floor: the
+/// path must be under $HOME, not $HOME, not a git repository, not held by a
+/// process, and not referenced by a service.
+pub fn reap_approved(path: &Path, approval: &str) -> Result<u64, String> {
+    let home = util::home();
+    let p = path.to_path_buf();
+    if !p.is_absolute() || !p.starts_with(&home) || p == home {
+        return Err("only absolute paths inside $HOME (and not $HOME itself)".into());
+    }
+    let md = fs::symlink_metadata(&p).map_err(|_| "gone".to_string())?;
+    if md.is_dir() && p.join(".git").exists() {
+        return Err(
+            "is a git repository/worktree: remove it with git after checking its work".into(),
+        );
+    }
+    if let Some(h) = InUse::snapshot().under(&p) {
+        return Err(format!("in use ({})", h.display()));
+    }
+    if let Some(src) = Refs::collect(&home).within(&p) {
+        return Err(format!("referenced by {src}"));
+    }
+    if approval.trim().is_empty() {
+        return Err("an approval note is required".into());
+    }
+    let before = fs_space(&home).map(|s| s.1).unwrap_or(0);
+    remove_tree(&p).map_err(|e| e.to_string())?;
+    let freed = fs_space(&home)
+        .map(|s| s.1)
+        .unwrap_or(0)
+        .saturating_sub(before);
+    append_log(&serde_json::json!({
+        "t": now(), "host": util::hostname(), "action": "approved-delete", "cat": "report",
+        "path": p, "freed_df_bytes": freed, "note": approval,
+    }));
+    Ok(freed)
 }
 
 fn remove_wt(p: &Path) -> bool {
@@ -505,8 +564,8 @@ fn remove_wt(p: &Path) -> bool {
 
 fn unseal(p: &Path) -> std::io::Result<()> {
     let m = fs::symlink_metadata(p)?;
+    platform::make_removable(p, &m)?;
     if m.is_dir() {
-        ensure_owner_rwx(p)?;
         for e in fs::read_dir(p)?.flatten() {
             unseal(&e.path())?;
         }
@@ -547,8 +606,10 @@ mod tests {
         assert_eq!(parse_docker_time("garbage"), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_tree_handles_read_only_trees() {
+        use std::os::unix::fs::PermissionsExt;
         let d = std::env::temp_dir().join(format!("diskreap-rm-{}", std::process::id()));
         let sealed = d.join("rel/hub/node_modules/x");
         fs::create_dir_all(&sealed).unwrap();
