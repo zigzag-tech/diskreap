@@ -22,6 +22,7 @@ echo 'A=1' >.env
 git add .gitignore package.json && git commit -qm init
 big node_modules/a/big 30M
 big artifacts/run1/hub/node_modules/x/big 20M
+echo '{}' >artifacts/run1/hub/package.json   # a staged release copy carries its manifest
 chmod -R a-w artifacts/run1/hub # sealed release copy
 head -c 120M /dev/zero >app.log
 
@@ -55,11 +56,24 @@ big "$T/tmp/stale-build/blob" 11M
 big "$T/tmp/live-session/blob" 11M
 python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" "$T/tmp/live-session/sock"
 
+# Regression 2026-10-02: installations that look like idle build output.
+TAG='Signature: 8a477f597d28d172789f06886806bc55'
+big "$H/.local/share/uv/tools/ytdl/lib/big" 12M            # uv tool venv: tagged by uv itself
+touch "$H/.local/share/uv/tools/ytdl/pyvenv.cfg"; echo "$TAG" >"$H/.local/share/uv/tools/ytdl/CACHEDIR.TAG"
+mkdir -p "$H/.local/bin" "$H/.local/share/uv/tools/ytdl/bin"; touch "$H/.local/share/uv/tools/ytdl/bin/ytdl"
+ln -s "$H/.local/share/uv/tools/ytdl/bin/ytdl" "$H/.local/bin/ytdl"
+big "$H/apps/tool/venv/lib/big" 12M; touch "$H/apps/tool/venv/pyvenv.cfg"   # venv with no project beside it
+printf '#!%s/apps/tool/venv/bin/python\n' "$H" >"$H/.local/bin/tool"; chmod +x "$H/.local/bin/tool"
+git init -q -b main "$H/active"                               # tagged Cargo target in a repo someone works in
+(cd "$H/active" && echo '[package]' >Cargo.toml && printf 'target/\n' >.gitignore && git add . && git commit -qm i)
+big "$H/active/target/debug/big" 12M; echo "$TAG" >"$H/active/target/CACHEDIR.TAG"
+
 # Age everything 60 days, then make one model recently used.
 chmod -R u+w "$H/repo/artifacts"
 find "$H" "$T/tmp" -mindepth 1 -exec touch -h -a -m -d '60 days ago' {} +
 chmod -R a-w "$H/repo/artifacts/run1/hub"
 touch -a "$H/.cache/huggingface/hub/models--new/w"
+touch "$H/active/.git/index"   # someone ran git there just now
 
 cd /
 DISKREAP_DEBUG=1 "$B" scan --level low --json >"$T/plan.json"
@@ -80,7 +94,10 @@ expect wt-envdiff "skip: holds ignored data"
 expect wt-envsame ok
 expect wt-detached ok # 60d idle > 30d pin horizon
 expect svc/venv "skip: project referenced by"
-expect plain/node_modules "skip: not inside a git repo"
+expect plain/node_modules "skip: no project manifest"
+expect .local/share/uv/tools/ytdl "skip: inside an installation root"
+expect apps/tool/venv "skip: no project manifest"
+expect active/target "skip: active"
 expect exported/daemon/target ok
 expect .cache/huggingface/hub ok
 expect "$T/tmp/stale-build" ok
@@ -99,6 +116,9 @@ kept wt-unmerged
 kept wt-stashed
 kept wt-envdiff/.env
 kept svc/venv
+kept .local/share/uv/tools/ytdl
+kept apps/tool/venv
+kept active/target
 kept repo/app.log
 gone "$T/tmp/stale-build"
 [ -S "$T/tmp/live-session/sock" ] && echo "ok    live-session socket kept" || { echo "FAIL  socket dir removed"; fail=1; }

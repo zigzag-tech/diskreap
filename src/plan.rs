@@ -206,7 +206,14 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             }
             idle(t, st.newest, cx.tmp_idle_days)
         }
-        "build-output" if cache_tagged(p) => {
+        "build-output" if under_install_root(p, cx.home).is_some() => Err(format!(
+            "inside an installation root ({}): installed software, not build output",
+            under_install_root(p, cx.home).unwrap()
+        )),
+        "build-output" if !has_project_manifest(p.parent().unwrap_or(p)) => {
+            Err("no project manifest beside it: an installation, not build output".into())
+        }
+        "build-output" if cache_tagged(p) && git::toplevel(p.parent().unwrap_or(p)).is_none() => {
             // Declared regenerable by its producer: no git evidence needed, but
             // the same use/reference/idle floor as any build output.
             let parent = p.parent().unwrap_or(p);
@@ -352,6 +359,33 @@ pub fn tmp_roots() -> Vec<PathBuf> {
     v.dedup();
     v.retain(|p| p.is_dir());
     v
+}
+
+/// Where installed software lives. A venv or a tagged directory here is an
+/// installation (a uv/pipx tool, an app's runtime or models), never build output.
+const INSTALL_ROOTS: &[&str] = &[
+    ".local/share", ".local/lib", ".local/pipx", ".cargo", ".rustup", ".nvm", ".volta", ".pyenv", ".sdkman",
+    ".npm-global", ".bun/install/global", "go/pkg", "anaconda3", "miniconda3", ".conda", ".julia",
+    "Library/Application Support", "AppData/Roaming", "AppData/Local/Programs",
+];
+
+pub fn under_install_root(p: &Path, home: &Path) -> Option<&'static str> {
+    INSTALL_ROOTS.iter().copied().find(|r| p.starts_with(home.join(r)))
+}
+
+/// Build output sits beside the manifest that regenerates it.
+const PROJECT_MANIFESTS: &[&str] = &[
+    "Cargo.toml", "package.json", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "uv.lock", "poetry.lock",
+    "pubspec.yaml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts", "pom.xml",
+    "CMakeLists.txt", "meson.build", "Podfile", "Package.swift", "go.mod", "tox.ini", "Gemfile", "mix.exs",
+];
+
+pub fn has_project_manifest(dir: &Path) -> bool {
+    PROJECT_MANIFESTS.iter().any(|m| dir.join(m).is_file())
+        || std::fs::read_dir(dir).map(|rd| rd.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("requirements") && n.ends_with(".txt")
+        })).unwrap_or(false)
 }
 
 /// Valid Cache Directory Tagging signature (https://bford.info/cachedir/).

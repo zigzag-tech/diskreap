@@ -210,7 +210,46 @@ impl Refs {
         if let Some(o) = run(&["crontab", "-l"], None, Duration::from_secs(10)) {
             r.scan_text(&o.stdout, "crontab", home);
         }
+        r.path_commands(home);
         r
+    }
+
+    /// Commands on PATH that live inside a tree: uv/pipx tools are symlinks into
+    /// their venv, `pip --user` scripts carry the venv's interpreter in `#!`. A
+    /// tool venv looks like idle build output (and uv even tags it CACHEDIR.TAG);
+    /// deleting it removed `yt-dlp`, `kimi`, `mitmproxy` from the fleet (2026-10-02).
+    fn path_commands(&mut self, home: &Path) {
+        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+        dirs.extend([home.join(".local/bin"), home.join("bin"), home.join(".cargo/bin")]);
+        dirs.sort();
+        dirs.dedup();
+        for d in dirs {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                let src = format!("command {} on PATH", p.display());
+                if let Ok(t) = std::fs::read_link(&p) {
+                    let t = if t.is_absolute() { t } else { d.join(t) };
+                    self.refs.push((t, src));
+                    continue;
+                }
+                // `#!/path/to/venv/bin/python` — read only the first line of small files.
+                if std::fs::metadata(&p).map(|m| m.is_file() && m.len() < 1 << 20).unwrap_or(false) {
+                    if let Ok(f) = std::fs::File::open(&p) {
+                        use std::io::{BufRead, BufReader, Read};
+                        let mut line = String::new();
+                        let _ = BufReader::new(f.take(512)).read_line(&mut line);
+                        if let Some(interp) = line.strip_prefix("#!") {
+                            if let Some(first) = interp.split_whitespace().next() {
+                                if first.starts_with('/') && Path::new(first).starts_with(home) {
+                                    self.refs.push((PathBuf::from(first), src));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn scan_text(&mut self, s: &str, src: &str, home: &Path) {
