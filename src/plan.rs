@@ -23,20 +23,22 @@ pub enum Level {
 }
 
 /// Low: free < 15% or < 30 GiB. Critical: free < 5% or < 10 GiB.
-/// Thresholds are a share of the disk clamped to absolute bounds: a bare
-/// percentage cries wolf on a 1.8 TB disk with 270 GB free, and a bare
-/// absolute floor cries wolf on a 30 GB VM that is 50% free (both seen in the
-/// first fleet scan).
-fn clamp_share(total: u64, pct: u64, lo: u64, hi: u64) -> u64 {
-    (total * pct / 100).clamp(lo, hi)
+/// Thresholds are a share of the filesystem, clamped to absolute bounds: a
+/// bare percentage cries wolf on a 1.8 TB disk with 270 GB free, a bare floor on
+/// a 30 GB VM that is half empty. The floor itself is capped at a share of the
+/// filesystem, or a 15 GB tmpfs would read "low" at 56% free (both seen in the
+/// fleet scans).
+fn clamp_share(total: u64, pct: u64, floor: u64, floor_cap_pct: u64, hi: u64) -> u64 {
+    let lo = floor.min(total * floor_cap_pct / 100);
+    (total * pct / 100).clamp(lo, hi.max(lo))
 }
 
-/// Low: free < 15% of the disk clamped to [10, 100] GiB.
-/// Critical: free < 5% clamped to [3, 30] GiB.
+/// Low: free < 15%, at least min(10 GiB, 30%), at most 100 GiB.
+/// Critical: free < 5%, at least min(3 GiB, 10%), at most 30 GiB.
 pub fn level_of(total: u64, avail: u64) -> Level {
-    if avail < clamp_share(total, 5, 3 * GB, 30 * GB) {
+    if avail < clamp_share(total, 5, 3 * GB, 10, 30 * GB) {
         Level::Critical
-    } else if avail < clamp_share(total, 15, 10 * GB, 100 * GB) {
+    } else if avail < clamp_share(total, 15, 10 * GB, 30, 100 * GB) {
         Level::Low
     } else {
         Level::Ok
@@ -45,7 +47,7 @@ pub fn level_of(total: u64, avail: u64) -> Level {
 
 /// `auto` stops once free space is back above this: 20% clamped to [15, 150] GiB.
 pub fn target_avail(total: u64) -> u64 {
-    clamp_share(total, 20, 15 * GB, 150 * GB)
+    clamp_share(total, 20, 15 * GB, 40, 150 * GB)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -729,9 +731,13 @@ mod tests {
         assert_eq!(target_avail(t), 150 * GB);
         let small = 30 * GB; // small VM: 50% free is fine
         assert_eq!(level_of(small, 15 * GB), Level::Ok);
-        assert_eq!(level_of(small, 9 * GB), Level::Low);
+        assert_eq!(level_of(small, 8 * GB), Level::Low); // floor = min(10 GiB, 30%) = 9 GiB
         assert_eq!(level_of(small, 2 * GB), Level::Critical);
         assert_eq!(level_of(400 * GB, 39 * GB), Level::Low); // 15% = 60 GiB
+        let tmpfs = 15 * GB + GB / 2; // half-empty small tmpfs is fine; nearly full is not
+        assert_eq!(level_of(tmpfs, 8 * GB), Level::Ok);
+        assert_eq!(level_of(tmpfs, 3 * GB), Level::Low);
+        assert_eq!(level_of(tmpfs, GB), Level::Critical);
     }
 
     #[test]
