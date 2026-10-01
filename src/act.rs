@@ -416,7 +416,7 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> u64 {
     let start_avail = avail();
     let mut est = 0u64;
     let verb = if o.apply { "" } else { "would " };
-    for cat in ORDER {
+    'run: for cat in ORDER {
         if !o.categories.is_empty() && !o.categories.iter().any(|c| c == cat) {
             continue;
         }
@@ -424,7 +424,7 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> u64 {
             if let Some(t) = o.until_avail {
                 if o.apply && avail() >= t {
                     println!("target reached: {} free", human(avail()));
-                    return avail().saturating_sub(start_avail);
+                    break 'run;
                 }
             }
             if let Err(why) = plan::check(it, &cx) {
@@ -478,11 +478,19 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> u64 {
             }
         }
     }
-    if o.apply {
-        avail().saturating_sub(start_avail)
-    } else {
-        est
+    if !o.apply {
+        return est;
     }
+    // Per-item sizes are logical estimates (compressed filesystems, shared
+    // image layers, hard links); the df delta is what was actually gained —
+    // and on btrfs/ZFS it keeps growing for a while as space is released.
+    let freed = avail().saturating_sub(start_avail);
+    let line = serde_json::json!({
+        "t": now(), "host": util::hostname(), "action": "run-summary",
+        "est_bytes": est, "freed_df_bytes": freed,
+    });
+    append_log(&line);
+    freed
 }
 
 fn remove_wt(p: &Path) -> bool {
@@ -506,11 +514,16 @@ fn unseal(p: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn log(it: &Item, action: &str, note: &str, bytes: u64) {
-    let line = serde_json::json!({
+/// One line per action. `est_bytes` is the scan's logical size estimate; the
+/// measured gain is in the run's `run-summary` line.
+fn log(it: &Item, action: &str, note: &str, est_bytes: u64) {
+    append_log(&serde_json::json!({
         "t": now(), "host": util::hostname(), "action": action, "cat": it.cat,
-        "path": it.path, "bytes": bytes, "note": note,
-    });
+        "path": it.path, "est_bytes": est_bytes, "note": note,
+    }));
+}
+
+fn append_log(line: &serde_json::Value) {
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)

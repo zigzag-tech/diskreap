@@ -71,7 +71,8 @@ diskreap clean --apply -c docker -c build-output   # only some categories (docke
 ```
 
 The plan expires after 6h — rescan if needed. Every action is appended to
-`~/.local/state/diskreap/actions.jsonl` (what, where, bytes).
+`~/.local/state/diskreap/actions.jsonl` (what, where, estimated bytes; each run
+ends with a `run-summary` line holding the measured df gain).
 
 ## Automatic mode
 

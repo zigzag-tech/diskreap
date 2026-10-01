@@ -90,7 +90,7 @@ diskreap auto [--dry-run] [--force]
 diskreap du [PATH] [--depth N] [--top N]   # hang-proof du
 ```
 
-- **State:** `~/.local/state/diskreap/`. It holds `plan.json` and `actions.jsonl`, an append-only audit log of everything that was compressed, pruned or removed.
+- **State:** `~/.local/state/diskreap/`. It holds `plan.json` and `actions.jsonl`, an append-only audit log of everything that was compressed, pruned or removed. Per-item `est_bytes` are logical sizes. Each run's `run-summary` line holds the measured `df` gain, which on btrfs/ZFS keeps growing for a while after the run.
 - **Protect a directory:** put an empty `.diskreap-keep` file in it.
 
 ## Agent skill
