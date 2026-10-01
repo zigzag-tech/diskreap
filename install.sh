@@ -47,8 +47,13 @@ if [ "$timer" = 1 ]; then
       plist="$HOME/Library/LaunchAgents/io.github.diskreap.auto.plist"
       mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.local/state/diskreap"
       sed -e "s#@BIN@#$bin#" -e "s#@HOME@#$HOME#g" "$here/deploy/io.github.diskreap.auto.plist" > "$plist"
-      launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
-      launchctl bootstrap "gui/$(id -u)" "$plist"
+      # gui/<uid> exists only with a login session; over SSH fall back to user/<uid>.
+      loaded=0
+      for dom in "gui/$(id -u)" "user/$(id -u)"; do
+        launchctl bootout "$dom" "$plist" 2>/dev/null || true
+        if launchctl bootstrap "$dom" "$plist" 2>/dev/null; then loaded=1; echo "launchd: loaded in $dom"; break; fi
+      done
+      [ "$loaded" = 1 ] || { echo "launchd: could not load $plist" >&2; exit 1; }
       ;;
   esac
   echo "scheduled: diskreap auto, hourly"
