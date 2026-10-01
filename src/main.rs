@@ -208,39 +208,54 @@ fn current_level() -> Level {
 
 fn status(hook: bool, json: bool) {
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
-    let lvl = level_of(t, a);
-    let pct = if t > 0 { a * 100 / t } else { 0 };
+    let fss = plan::watched_filesystems();
+    let worst = fss.iter().map(|f| f.level).max().unwrap_or(level_of(t, a));
     if json {
+        // Top-level numbers stay $HOME's filesystem; `level` is the worst watched one.
         println!(
             "{}",
             serde_json::json!({
                 "host": util::hostname(), "home": home(), "total_bytes": t, "avail_bytes": a,
-                "level": lvl, "target_avail_bytes": target_avail(t), "version": env!("CARGO_PKG_VERSION"),
+                "level": worst, "home_level": level_of(t, a), "target_avail_bytes": target_avail(t),
+                "filesystems": fss, "version": env!("CARGO_PKG_VERSION"),
             })
         );
         return;
     }
     if hook {
-        if lvl != Level::Ok {
+        for f in fss.iter().filter(|f| f.level != Level::Ok) {
+            let pct = if f.total_bytes > 0 {
+                f.avail_bytes * 100 / f.total_bytes
+            } else {
+                0
+            };
             println!(
                 "DISK {}: only {} free ({pct}%) on {} ({}). Before writing large outputs, run `diskreap scan` and \
-                 follow the disk-cleanup skill; `diskreap auto` also runs hourly. Do not use plain `du`/`find` over $HOME (network mounts hang).",
-                if lvl == Level::Critical { "CRITICAL" } else { "LOW" },
-                human(a),
+                 follow the disk-cleanup skill. Do not use plain `du`/`find` over $HOME (network mounts hang).",
+                if f.level == Level::Critical { "CRITICAL" } else { "LOW" },
+                human(f.avail_bytes),
                 util::hostname(),
-                home().display()
+                f.path
             );
         }
         return;
     }
-    println!(
-        "{}: {} free of {} ({pct}%) — level {:?}, auto target {}",
-        util::hostname(),
-        human(a),
-        human(t),
-        lvl,
-        human(target_avail(t))
-    );
+    for f in &fss {
+        let pct = if f.total_bytes > 0 {
+            f.avail_bytes * 100 / f.total_bytes
+        } else {
+            0
+        };
+        println!(
+            "{}: {} — {} free of {} ({pct}%), level {:?}",
+            util::hostname(),
+            f.path,
+            human(f.avail_bytes),
+            human(f.total_bytes),
+            f.level
+        );
+    }
+    println!("auto target for $HOME: {}", human(target_avail(t)));
     if let Some(p) = Plan::load() {
         println!(
             "last plan: {} scan {} ago, {} reclaimable",
@@ -254,22 +269,36 @@ fn status(hook: bool, json: bool) {
 fn auto(dry_run: bool, force: bool, min_level: Level) {
     let _lock = lock_or_exit("auto.lock");
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
-    let lvl = level_of(t, a);
+    let home_level = level_of(t, a);
+    let worst = plan::watched_filesystems()
+        .iter()
+        .map(|f| f.level)
+        .max()
+        .unwrap_or(home_level);
     println!(
-        "[{}] {}: {} free ({:?})",
+        "[{}] {}: {} free in $HOME ({:?}); worst watched filesystem {:?}",
         now(),
         util::hostname(),
         human(a),
-        lvl
+        home_level,
+        worst
     );
-    if lvl < min_level && !force {
+    if worst < min_level && !force {
         return;
     }
+    // Only a temp filesystem is under pressure: clean temp entries (judged by
+    // that filesystem's level), not $HOME by $HOME's healthy policy.
+    let tmp_only = home_level < min_level && !force;
+    let cats: Vec<String> = if tmp_only {
+        vec!["tmp".into()]
+    } else {
+        Vec::new()
+    };
     let target = target_avail(t);
     for full in [false, true] {
         let plan = plan::scan(&ScanOpts {
             full,
-            level: lvl,
+            level: home_level,
             root: None,
             threads: THREADS,
         });
@@ -284,8 +313,8 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
             &plan,
             &act::ApplyOpts {
                 apply: !dry_run,
-                categories: &[],
-                until_avail: Some(target),
+                categories: &cats,
+                until_avail: if tmp_only { None } else { Some(target) },
                 quiet: false,
             },
         );
@@ -300,13 +329,16 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
             human(freed)
         );
         let now_avail = fs_space(&home()).map(|s| s.1).unwrap_or(0);
-        if dry_run || now_avail >= target {
+        if dry_run || tmp_only || now_avail >= target {
             return;
         }
     }
     let now_avail = fs_space(&home()).map(|s| s.1).unwrap_or(0);
     if level_of(t, now_avail) != Level::Ok {
-        println!("still {:?} after safe cleanup: a human/agent must review `diskreap scan --full -v` (report-only items)", level_of(t, now_avail));
+        println!(
+            "still {:?} after safe cleanup: a human/agent must review `diskreap scan --full -v` (report-only items)",
+            level_of(t, now_avail)
+        );
     }
 }
 

@@ -49,7 +49,7 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 | `docker` | build cache, dangling images, and (critical only) images no container uses, created 7d+ ago | age (24h / 1h) | `docker builder/image prune`; `docker rmi` per unused tag (`image prune -a` silently skips tagged images on the containerd image store) |
 | `tmp` | user-owned entries directly under `/tmp`, `/var/tmp`, `$TMPDIR` | idle ≥ 7d (2d critical), not in use, no socket/FIFO inside (a tmux/ssh-agent rendezvous looks idle) | delete |
 | `log` | `*.log`, `*.log.N` ≥ 500 MB (100 MB critical) | unwritten 24h, not open, not tracked | zstd (lossless) |
-| `build-output` | `node_modules`, Cargo `target`, `build`†, `.dart_tool`, `.gradle`†, `.next`/`.nuxt`/`.svelte-kit`/`.angular`†, Python venvs (by `pyvenv.cfg`), `Pods`†, `.build`†, `.tox`, `.pytest_cache`, … | git-ignored, no tracked files, idle ≥ 3d (1d critical), project not in use, not referenced by a service | delete |
+| `build-output` | any directory carrying a valid `CACHEDIR.TAG` (the cache-tagging standard Cargo, pip and others use; honored even outside git), `node_modules`, Cargo `target`, `build`†, `.dart_tool`, `.gradle`†, `.next`/`.nuxt`/`.svelte-kit`/`.angular`†, Python venvs (by `pyvenv.cfg`), `Pods`†, `.build`†, `.tox`, `.pytest_cache`, … | git-ignored, no tracked files, idle ≥ 3d (1d critical), project not in use, not referenced by a service | delete |
 | `cache` | pip, uv, npm, pnpm, yarn, bun, cargo, go, gradle, maven, pub, conda pkgs, Playwright, Puppeteer, Chrome/Chromium/Firefox, Hugging Face, ModelScope, torch, Android, Xcode, `~/Library/Caches` | last use (file atime) beyond the horizon; files held open are kept; the tool's own prune where one exists | prune |
 | `worktree` | linked git worktrees | clean, merged into the main branch (incl. patch-equivalent), not locked, no stash entry naming the branch, no ignored data except build artifacts or files identical to the main checkout's, idle ≥ 3d (30d if HEAD is detached), not in use, not referenced | `git worktree remove` (branch kept) |
 | report only | app caches inside repos, data unmodified for 90d+, trash | — | listed for a human |
@@ -59,6 +59,9 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 "In use" covers the cwd, executable, open files and mmapped libraries of every process you can inspect, plus the bind-mount sources of running Docker containers and the cwd of every tmux pane. The tmux check matters because sandboxed agents are often non-dumpable, so `/proc/<pid>/cwd` is unreadable even for your own uid. On macOS this comes from `lsof`. If the snapshot can't be taken, everything counts as in use.
 
 ## Pressure levels
+
+diskreap watches `$HOME`'s filesystem and every temp root (`/tmp`, `/var/tmp`, `$TMPDIR`) that lives on a different one. A full tmpfs counts too: it is RAM. `status` and the hook report each one under pressure, and temp entries are judged by their own filesystem's level.
+
 
 | Level | Free space | Effect |
 |---|---|---|

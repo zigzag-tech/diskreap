@@ -163,6 +163,9 @@ impl Plan {
 }
 
 pub struct Ctx<'a> {
+    /// Judged by the pressure of the temp dirs' own filesystem (a full tmpfs
+    /// while $HOME is fine — zz-joe, 2026-10-01).
+    pub tmp_idle_days: i64,
     pub home: &'a Path,
     pub inuse: &'a InUse,
     pub refs: &'a Refs,
@@ -199,7 +202,23 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             if st.special {
                 return Err("holds a socket or FIFO (a live session's rendezvous)".into());
             }
-            idle(t, st.newest, cx.policy.tmp_idle_days)
+            idle(t, st.newest, cx.tmp_idle_days)
+        }
+        "build-output" if cache_tagged(p) => {
+            // Declared regenerable by its producer: no git evidence needed, but
+            // the same use/reference/idle floor as any build output.
+            let parent = p.parent().unwrap_or(p);
+            if let Some(h) = cx.inuse.under(parent) {
+                return Err(format!("project in use ({})", h.display()));
+            }
+            if let Some(src) = cx.refs.within(parent) {
+                return Err(format!("project referenced by {src}"));
+            }
+            idle(
+                t,
+                it.newest.max(util::mtime_of(p)),
+                cx.policy.build_idle_days,
+            )
         }
         "build-output" => {
             let top = git::toplevel(p.parent().unwrap_or(p)).ok_or("not inside a git repo")?;
@@ -235,7 +254,12 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             // Cheapest decisive checks first: on a busy host most worktrees are
             // active, and `git status` over 300 of them took 226 s (xc-tower-ubuntu).
             let top_mtime = std::fs::read_dir(p)
-                .map(|rd| rd.flatten().map(|e| util::mtime_of(&e.path())).max().unwrap_or(0))
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| util::mtime_of(&e.path()))
+                        .max()
+                        .unwrap_or(0)
+                })
                 .unwrap_or(0);
             // Detached HEAD is often a deliberate pin (referenced by path elsewhere): wait much longer.
             let days = if git::detached(p) {
@@ -328,6 +352,57 @@ pub fn tmp_roots() -> Vec<PathBuf> {
     v
 }
 
+/// Valid Cache Directory Tagging signature (https://bford.info/cachedir/).
+pub fn cache_tagged(dir: &Path) -> bool {
+    std::fs::read(dir.join("CACHEDIR.TAG"))
+        .map(|b| b.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"))
+        .unwrap_or(false)
+}
+
+/// A filesystem diskreap can clean, with its own pressure level.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FsState {
+    pub path: String,
+    pub total_bytes: u64,
+    pub avail_bytes: u64,
+    pub level: Level,
+}
+
+/// $HOME's filesystem first, then each temp root on a different filesystem.
+pub fn watched_filesystems() -> Vec<FsState> {
+    let mut out: Vec<FsState> = Vec::new();
+    let mut seen: Vec<(u64, u64)> = Vec::new();
+    for p in std::iter::once(util::home()).chain(tmp_roots()) {
+        let Some((t, a)) = fs_space(&p) else { continue };
+        // Same size and (nearly) same free space ≈ same filesystem; cheap and portable.
+        if seen
+            .iter()
+            .any(|(st, sa)| *st == t && sa.abs_diff(a) < 64 << 20)
+        {
+            continue;
+        }
+        seen.push((t, a));
+        out.push(FsState {
+            path: p.to_string_lossy().into_owned(),
+            total_bytes: t,
+            avail_bytes: a,
+            level: level_of(t, a),
+        });
+    }
+    out
+}
+
+/// Policy for temp entries: the stricter of the scan level and the temp filesystems' own.
+pub fn tmp_idle_days(scan_level: Level) -> i64 {
+    let tmp_level = watched_filesystems()
+        .iter()
+        .skip(1)
+        .map(|f| f.level)
+        .max()
+        .unwrap_or(Level::Ok);
+    Policy::for_level(scan_level.max(tmp_level)).tmp_idle_days
+}
+
 pub fn expand(s: &str, home: &Path) -> String {
     match s.strip_prefix("~/") {
         Some(r) => home.join(r).to_string_lossy().into_owned(),
@@ -372,6 +447,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
     let inuse = InUse::snapshot();
     let refs = Refs::collect(&home);
     let cx = Ctx {
+        tmp_idle_days: tmp_idle_days(o.level),
         home: &home,
         inuse: &inuse,
         refs: &refs,

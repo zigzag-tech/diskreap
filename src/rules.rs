@@ -67,6 +67,18 @@ impl Classify for Rules {
     }
 
     fn self_dir(&self, _path: &Path, entries: &[(String, bool)]) -> Option<DirHit> {
+        // The Cache Directory Tagging standard: Cargo `target/`, pip and others
+        // declare "regenerable" with CACHEDIR.TAG — honored even outside git.
+        if entries
+            .iter()
+            .any(|(n, is_dir)| n == "CACHEDIR.TAG" && !is_dir)
+        {
+            return Some(DirHit {
+                kind: "build-output",
+                prune: true,
+                size: true,
+            });
+        }
         // A Python virtualenv under any name (python-venv-ocr, env, …).
         if entries
             .iter()
@@ -253,6 +265,12 @@ mod tests {
         assert!(r.self_dir(p, &[(".git".into(), true)]).is_none());
         assert_eq!(
             r.self_dir(p, &[("pyvenv.cfg".into(), false)]).unwrap().kind,
+            "build-output"
+        );
+        assert_eq!(
+            r.self_dir(p, &[("CACHEDIR.TAG".into(), false)])
+                .unwrap()
+                .kind,
             "build-output"
         );
         assert_eq!(r.child_dir(p, "blob-cache", &[]).unwrap().kind, "app-cache");

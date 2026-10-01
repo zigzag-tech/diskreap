@@ -338,6 +338,35 @@ pub fn parse_docker_time(s: &str) -> Option<i64> {
     Some(days * DAY + t[0] * 3600 + t[1] * 60 + t[2] - off)
 }
 
+/// Free bytes on Docker's own data filesystem (often not $HOME's).
+fn docker_root_avail() -> Option<u64> {
+    let root = run(
+        &["docker", "info", "--format", "{{.DockerRootDir}}"],
+        None,
+        DOCKER_T,
+    )
+    .filter(|o| o.ok)
+    .map(|o| o.stdout.trim().to_string())
+    .filter(|s| !s.is_empty())?;
+    // The root dir itself is often root-only; its parent resolves to the same filesystem.
+    let p = Path::new(&root);
+    fs_space(p)
+        .or_else(|| p.parent().and_then(fs_space))
+        .map(|s| s.1)
+}
+
+/// Prune and return the bytes measured on Docker's filesystem (`docker system
+/// df` is an upper bound: recent cache is kept and layers are shared).
+fn docker_clean_measured(p: &plan::Policy) -> (bool, u64) {
+    let before = docker_root_avail();
+    let ok = docker_clean(p);
+    let gained = match (before, docker_root_avail()) {
+        (Some(b), Some(a)) => a.saturating_sub(b),
+        _ => 0,
+    };
+    (ok, gained)
+}
+
 fn docker_clean(p: &plan::Policy) -> bool {
     let t = Duration::from_secs(3600);
     let until = format!("until={}", p.docker_until);
@@ -415,6 +444,7 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
     let inuse = InUse::snapshot();
     let refs = Refs::collect(&home);
     let cx = Ctx {
+        tmp_idle_days: plan::tmp_idle_days(plan.level),
         home: &home,
         inuse: &inuse,
         refs: &refs,
@@ -481,11 +511,11 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
                 "build-output" | "tmp" => ("delete", it.bytes, !o.apply || remove_tree(p).is_ok()),
                 "log" => ("compress", it.bytes, !o.apply || compress(p)),
                 "worktree" => ("remove-worktree", it.bytes, !o.apply || remove_wt(p)),
-                "docker" => (
-                    "docker-prune",
-                    it.bytes,
-                    !o.apply || docker_clean(&plan.policy),
-                ),
+                "docker" if o.apply => {
+                    let (ok, gained) = docker_clean_measured(&plan.policy);
+                    ("docker-prune", gained, ok)
+                }
+                "docker" => ("docker-prune", it.bytes, true),
                 "cache" if o.apply => ("prune-cache", cache_pass(it, &cx, true).bytes, true),
                 "cache" => ("prune-cache", it.bytes, true),
                 _ => continue,

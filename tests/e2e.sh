@@ -44,6 +44,10 @@ mkdir -p "$H/.config/systemd/user"
 printf '[Service]\nExecStart=%s/svc/venv/bin/python -m srv\n' "$H" >"$H/.config/systemd/user/svc.service"
 
 mkdir -p "$H/plain/node_modules" && big "$H/plain/node_modules/f" 12M
+# An exported (non-git) Cargo tree: target/ declares itself a cache via CACHEDIR.TAG.
+big "$H/exported/daemon/target/release/big" 12M
+printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$H/exported/daemon/target/CACHEDIR.TAG"
+echo '[package]' >"$H/exported/daemon/Cargo.toml"
 big "$H/.cache/huggingface/hub/models--old/w" 11M
 big "$H/.cache/huggingface/hub/models--new/w" 11M
 
@@ -77,6 +81,7 @@ expect wt-envsame ok
 expect wt-detached ok # 60d idle > 30d pin horizon
 expect svc/venv "skip: project referenced by"
 expect plain/node_modules "skip: not inside a git repo"
+expect exported/daemon/target ok
 expect .cache/huggingface/hub ok
 expect "$T/tmp/stale-build" ok
 expect "$T/tmp/live-session" "skip: holds a socket"
@@ -85,6 +90,7 @@ expect "$T/tmp/live-session" "skip: holds a socket"
 gone() { if [ -e "$H/$1" ] || { [[ "$1" == /* ]] && [ -e "$1" ]; }; then echo "FAIL  $1 still exists"; fail=1; else echo "ok    $1 removed"; fi; }
 kept() { if [ -e "$H/$1" ]; then echo "ok    $1 kept"; else echo "FAIL  $1 was removed"; fail=1; fi; }
 gone repo/node_modules
+gone exported/daemon/target
 gone repo/artifacts/run1/hub/node_modules
 gone wt-merged
 gone .cache/huggingface/hub/models--old
