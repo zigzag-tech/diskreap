@@ -136,6 +136,9 @@ pub struct Plan {
     pub total: u64,
     pub avail: u64,
     pub scan_secs: f64,
+    /// Seconds per scan phase, in order — where a slow scan spends its time.
+    #[serde(default)]
+    pub phase_secs: Vec<(String, f64)>,
     pub items: Vec<Item>,
     /// Largest directories (full scan): (path, bytes, newest mtime).
     pub top: Vec<(String, u64, i64)>,
@@ -206,11 +209,12 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             if let Some(src) = cx.refs.within(&top) {
                 return Err(format!("project referenced by {src}"));
             }
+            let last = it.newest.max(git::activity(&top)).max(util::mtime_of(p));
+            idle(t, last, cx.policy.build_idle_days)?;
             if !git::ignored_untracked(&top, p) {
                 return Err("not git-ignored, or contains tracked files".into());
             }
-            let last = it.newest.max(git::activity(&top)).max(util::mtime_of(p));
-            idle(t, last, cx.policy.build_idle_days)
+            Ok(())
         }
         "worktree" => {
             let gitdir = git::linked_worktree_gitdir(p).ok_or("not a linked worktree")?;
@@ -223,29 +227,15 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             if let Some(src) = cx.refs.within(p) {
                 return Err(format!("referenced by {src}"));
             }
-            match git::dirty_count(p) {
-                Some(0) => {}
-                Some(n) => return Err(format!("{n} uncommitted/untracked change(s)")),
-                None => return Err("git status failed".into()),
+            if !gitdir.exists() {
+                // Its admin dir was pruned or belongs to a deleted clone: git can no
+                // longer vouch for the files — a person must look.
+                return Err("orphaned worktree (its git admin dir is gone)".into());
             }
-            let base = git::base_ref(p).ok_or("no main/master/origin HEAD to compare with")?;
-            if !git::merged_into(p, &base) {
-                return Err(format!("has commits not in {base}"));
-            }
-            if git::stash_names_branch(p) {
-                return Err("a stash entry names its branch".into());
-            }
-            let main = git::main_checkout(p).ok_or("main checkout not found")?;
-            if let Some(f) = git::ignored_data(p, &main) {
-                return Err(format!("holds ignored data not in the main checkout: {f}"));
-            }
+            // Cheapest decisive checks first: on a busy host most worktrees are
+            // active, and `git status` over 300 of them took 226 s (xc-tower-ubuntu).
             let top_mtime = std::fs::read_dir(p)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| util::mtime_of(&e.path()))
-                        .max()
-                        .unwrap_or(0)
-                })
+                .map(|rd| rd.flatten().map(|e| util::mtime_of(&e.path())).max().unwrap_or(0))
                 .unwrap_or(0);
             // Detached HEAD is often a deliberate pin (referenced by path elsewhere): wait much longer.
             let days = if git::detached(p) {
@@ -253,7 +243,24 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             } else {
                 cx.policy.worktree_idle_days
             };
-            idle(t, it.newest.max(git::activity(p)).max(top_mtime), days)
+            idle(t, it.newest.max(git::activity(p)).max(top_mtime), days)?;
+            let base = git::base_ref(p).ok_or("no main/master/origin HEAD to compare with")?;
+            if !git::merged_into(p, &base) {
+                return Err(format!("has commits not in {base}"));
+            }
+            if git::stash_names_branch(p) {
+                return Err("a stash entry names its branch".into());
+            }
+            match git::dirty_count(p) {
+                Some(0) => {}
+                Some(n) => return Err(format!("{n} uncommitted/untracked change(s)")),
+                None => return Err("git status failed".into()),
+            }
+            let main = git::main_checkout(p).ok_or("main checkout not found")?;
+            if let Some(f) = git::ignored_data(p, &main) {
+                return Err(format!("holds ignored data not in the main checkout: {f}"));
+            }
+            Ok(())
         }
         "log" => {
             if cx.inuse.under(p).is_some() {
@@ -343,6 +350,12 @@ pub fn scan(o: &ScanOpts) -> Plan {
     let mounts = mounts::list();
     let (total, avail) = fs_space(&home).unwrap_or((0, 0));
 
+    let mut phases: Vec<(String, f64)> = Vec::new();
+    let mut lap = Instant::now();
+    let mut mark = |name: &str| {
+        phases.push((name.to_string(), lap.elapsed().as_secs_f64()));
+        lap = Instant::now();
+    };
     let w = walk::walk(
         Opts {
             skip: mounts::below(&mounts, &root),
@@ -355,6 +368,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         },
         Box::new(Rules { quick: !o.full }),
     );
+    mark("walk");
     let inuse = InUse::snapshot();
     let refs = Refs::collect(&home);
     let cx = Ctx {
@@ -372,6 +386,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
     let mut items: Vec<Item> = Vec::new();
 
     // Worktrees first: a build-output inside an ok worktree goes with the worktree.
+    mark("in-use+refs");
     let wts: Vec<Item> = w
         .found
         .iter()
@@ -394,6 +409,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         .map(|i| PathBuf::from(&i.path))
         .collect();
     items.extend(wts);
+    mark("worktrees");
     let builds: Vec<Item> = w
         .found
         .iter()
@@ -405,6 +421,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         .map(|f| item("build-output", &f.path, f.bytes, f.newest))
         .collect();
     items.extend(verdicts(builds, &cx));
+    mark("build-output");
     for f in &w.files {
         if ok_worktrees.iter().any(|wt| f.path.starts_with(wt)) {
             continue;
@@ -414,6 +431,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         items.push(it);
     }
 
+    mark("logs");
     for c in CACHES {
         let dir = home.join(c.rel);
         if !dir.is_dir() {
@@ -451,6 +469,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         items.push(it);
     }
 
+    mark("caches");
     if which("docker").is_some() {
         let mut it = item("docker", Path::new("docker"), 0, 0);
         verdict(&mut it, &cx);
@@ -492,6 +511,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         );
         items.push(it);
     }
+    mark("docker");
     let mut tmps: Vec<Item> = Vec::new();
     for root in tmp_roots() {
         for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
@@ -515,6 +535,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         }
     }
 
+    mark("tmp+report");
     // Cold data (full scan): big, untouched for 90d, not a candidate already.
     let mut top: Vec<(String, u64, i64)> = Vec::new();
     if o.full {
@@ -560,6 +581,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         total,
         avail,
         scan_secs: started.elapsed().as_secs_f64(),
+        phase_secs: phases,
         items,
         top,
         stalled: s(&w.stalled),
