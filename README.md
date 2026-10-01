@@ -62,17 +62,17 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 
 | Level | Free space | Effect |
 |---|---|---|
-| ok | ≥ 15% and ≥ 30 GiB | `auto` does nothing |
-| low | < 15% or < 30 GiB | normal horizons |
-| critical | < 5% or < 10 GiB | shorter horizons (build/worktree 1d, logs 100 MB/6h, caches at 25% of their horizon, unused Docker images) |
+| ok | ≥ 15% of the disk, clamped to [10, 100] GiB | daily maintenance only: clearly stale items (build output idle 14d, worktrees 7d, caches at 2× horizon, logs ≥ 1 GB idle 7d, Docker cache older than 7d) |
+| low | below that | normal horizons |
+| critical | < 5% of the disk, clamped to [3, 30] GiB | shorter horizons (build/worktree 1d, logs 100 MB/6h, caches at 25% of their horizon, unused Docker images) |
 
-`auto` stops as soon as free space is back above max(20%, 40 GiB). It escalates in this order: Docker, logs, temp dirs, build output, caches, worktrees. It only runs the full scan if the quick plan wasn't enough.
+`auto` stops as soon as free space is back above 20% of the disk, clamped to [15, 150] GiB. It escalates in this order: Docker, logs, temp dirs, build output, caches, worktrees. It only runs the full scan if the quick plan wasn't enough.
 
 ## Install
 
 ```bash
 git clone https://github.com/zigzag-tech/diskreap && cd diskreap
-./install.sh                 # binary + hourly timer (systemd user / launchd) + agent skill links
+./install.sh                 # binary + hourly critical-only guard (systemd user / launchd / cron) + agent skill links
 ./install.sh --claude-hook   # also warn Claude Code sessions when the disk is low
 ```
 
@@ -86,7 +86,9 @@ On Linux, user timers need lingering to run while you're logged out: `sudo login
 diskreap status                 # free space, level, last plan
 diskreap scan [--full] [-v] [--json] [--level low|critical]
 diskreap clean [--apply] [-c CATEGORY]...
-diskreap auto [--dry-run] [--force]
+diskreap auto [--dry-run] [--min-level ok|low|critical]   # schedule `--min-level ok` daily for maintenance
+diskreap reap PATH --approval NOTE   # remove one human-approved report-only item
+diskreap status|clean --json          # machine-readable, for orchestrators
 diskreap du [PATH] [--depth N] [--top N]   # hang-proof du
 ```
 

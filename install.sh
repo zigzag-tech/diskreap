@@ -56,7 +56,7 @@ if [ "$timer" = 1 ]; then
       if [ "$loaded" = 0 ]; then
         # Over SSH with no GUI session the launchd domains refuse (125 / 5): use cron.
         rm -f "$plist"
-        line="17 * * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin $bin auto >> $HOME/.local/state/diskreap/auto.log 2>&1"
+        line="17 * * * * PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin $bin auto --min-level critical >> $HOME/.local/state/diskreap/auto.log 2>&1"
         { crontab -l 2>/dev/null | grep -v 'diskreap auto'; echo "$line"; } | crontab -
         echo "launchd unavailable (no GUI session) — scheduled via crontab instead"
       fi

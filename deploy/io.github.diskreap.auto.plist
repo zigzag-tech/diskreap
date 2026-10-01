@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>io.github.diskreap.auto</string>
-  <key>ProgramArguments</key><array><string>@BIN@</string><string>auto</string></array>
+  <key>ProgramArguments</key><array><string>@BIN@</string><string>auto</string><string>--min-level</string><string>critical</string></array>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
   <key>LowPriorityIO</key><true/>

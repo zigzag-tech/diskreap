@@ -3,7 +3,7 @@ Description=diskreap: reclaim disk space when it runs low
 
 [Service]
 Type=oneshot
-ExecStart=@BIN@ auto
+ExecStart=@BIN@ auto --min-level critical
 Nice=19
 IOSchedulingClass=idle
 TimeoutStartSec=3h

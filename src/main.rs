@@ -77,7 +77,8 @@ enum Cmd {
         /// Act even when space is fine (uses the current level's policy).
         #[arg(long)]
         force: bool,
-        /// Act only at this pressure level or worse (the local guard uses `critical`).
+        /// Act only at this pressure level or worse: `critical` for an hourly
+        /// guard, `ok` for a daily maintenance run (Ok uses the conservative policy).
         #[arg(long, default_value = "low")]
         min_level: Level,
     },
@@ -261,7 +262,7 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
         human(a),
         lvl
     );
-    if lvl < min_level.max(Level::Low) && !force {
+    if lvl < min_level && !force {
         return;
     }
     let target = target_avail(t);
