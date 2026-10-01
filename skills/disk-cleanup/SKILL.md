@@ -48,8 +48,11 @@ Each category lists what is reclaimable now, plus skipped items with the reason:
   Hugging Face / ModelScope / torch models, Xcode DerivedData, `~/Library/Caches`),
   pruned by last use (file atime) — only entries unused for the horizon go.
 - **worktree** — linked git worktrees that are clean (no changes, no untracked
-  files), fully merged into the main branch (incl. rebased equivalents), idle
-  ≥ 3d (30d when HEAD is detached — likely a pin), and not in use. The branch is kept.
+  files), fully merged into the main branch (incl. rebased equivalents), not
+  locked, with no stash naming the branch and no ignored data beyond build
+  artifacts (an ignored `.env` that differs from the main checkout's keeps it),
+  idle ≥ 3d (30d when HEAD is detached — likely a pin), not in use by a process
+  or a tmux pane. The branch is kept.
 - **REPORT ONLY** — never auto-cleaned: app-local caches inside repos, data not
   modified for 90d+, trash. **A human decides.** Present these to the user with
   sizes; do not delete them yourself unless the user says which.

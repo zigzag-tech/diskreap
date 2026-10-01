@@ -143,3 +143,94 @@ pub fn detached(wt: &Path) -> bool {
         .map(|o| !o.ok)
         .unwrap_or(true)
 }
+
+/// `git worktree lock`ed: someone said "keep".
+pub fn locked(gitdir: &Path) -> bool {
+    gitdir.join("locked").exists()
+}
+
+/// Stashes are repo-global: a clean worktree can still have work parked in a
+/// stash entry that names its branch.
+pub fn stash_names_branch(wt: &Path) -> bool {
+    let Some(b) = line(wt, &["symbolic-ref", "-q", "--short", "HEAD"]) else {
+        return false;
+    };
+    git(wt, &["stash", "list"])
+        .map(|o| {
+            o.stdout
+                .lines()
+                .any(|l| l.contains(&format!("On {b}:")) || l.contains(&format!("WIP on {b}:")))
+        })
+        .unwrap_or(true)
+}
+
+/// Directory names whose contents are regenerable by definition.
+const ARTIFACT_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".dart_tool",
+    ".gradle",
+    ".cxx",
+    "__pycache__",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".angular",
+    ".turbo",
+    ".parcel-cache",
+    "coverage",
+    ".venv",
+    "venv",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "Pods",
+    ".build",
+];
+
+/// Removing a worktree also deletes its IGNORED files (.env, local data, run
+/// logs). Allowed: build-artifact dirs, symlinks, and files byte-identical to
+/// the main checkout's copy (bootstrap-copied config). Returns the first
+/// ignored path that would be lost.
+pub fn ignored_data(wt: &Path, main: &Path) -> Option<String> {
+    let o = git(
+        wt,
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "--untracked-files=normal",
+        ],
+    )?;
+    for l in o.stdout.lines() {
+        let Some(rel) = l.strip_prefix("!! ") else {
+            continue;
+        };
+        let rel = rel.trim_end_matches('/');
+        if Path::new(rel)
+            .components()
+            .any(|c| ARTIFACT_DIRS.contains(&c.as_os_str().to_string_lossy().as_ref()))
+        {
+            continue;
+        }
+        let p = wt.join(rel);
+        let Ok(md) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if md.file_type().is_symlink() {
+            continue;
+        }
+        if md.is_file() {
+            if let (Ok(a), Ok(b)) = (std::fs::read(&p), std::fs::read(main.join(rel))) {
+                if a == b {
+                    continue;
+                }
+            }
+        }
+        return Some(rel.to_string());
+    }
+    None
+}

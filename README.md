@@ -50,12 +50,12 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 | `log` | `*.log`, `*.log.N` ≥ 500 MB (100 MB critical) | unwritten 24h, not open, not tracked | zstd (lossless) |
 | `build-output` | `node_modules`, Cargo `target`, `build`†, `.dart_tool`, `.gradle`†, `.next`/`.nuxt`/`.svelte-kit`/`.angular`†, Python venvs (by `pyvenv.cfg`), `Pods`†, `.build`†, `.tox`, `.pytest_cache`, … | git-ignored, no tracked files, idle ≥ 3d (1d critical), project not in use, not referenced by a service | delete |
 | `cache` | pip, uv, npm, pnpm, yarn, bun, cargo, go, gradle, maven, pub, conda pkgs, Playwright, Puppeteer, Chrome/Chromium/Firefox, Hugging Face, ModelScope, torch, Android, Xcode, `~/Library/Caches` | last use (file atime) beyond the horizon; files held open are kept; the tool's own prune where one exists | prune |
-| `worktree` | linked git worktrees | clean, merged into the main branch (incl. patch-equivalent), idle ≥ 3d (30d if HEAD is detached), not in use, not referenced | `git worktree remove` (branch kept) |
+| `worktree` | linked git worktrees | clean, merged into the main branch (incl. patch-equivalent), not locked, no stash entry naming the branch, no ignored data except build artifacts or files identical to the main checkout's, idle ≥ 3d (30d if HEAD is detached), not in use, not referenced | `git worktree remove` (branch kept) |
 | report only | app caches inside repos, data unmodified for 90d+, trash | — | listed for a human |
 
 † only next to a matching project marker (`Cargo.toml`, `package.json`, `build.gradle`, `Podfile`, `Package.swift`, …).
 
-"In use" covers the cwd, executable, open files and mmapped libraries of every process you can inspect, plus the bind-mount sources of running Docker containers. On macOS this comes from `lsof`. If the snapshot can't be taken, everything counts as in use.
+"In use" covers the cwd, executable, open files and mmapped libraries of every process you can inspect, plus the bind-mount sources of running Docker containers and the cwd of every tmux pane. The tmux check matters because sandboxed agents are often non-dumpable, so `/proc/<pid>/cwd` is unreadable even for your own uid. On macOS this comes from `lsof`. If the snapshot can't be taken, everything counts as in use.
 
 ## Pressure levels
 
@@ -95,6 +95,13 @@ diskreap du [PATH] [--depth N] [--top N]   # hang-proof du
 ## Agent skill
 
 `skills/disk-cleanup/SKILL.md` teaches coding agents (Claude Code, Codex, and others) the two-stage workflow. It also tells them to present report-only items to a human rather than delete them.
+
+## Tests
+
+```bash
+cargo test                  # unit tests
+cargo build --release && tests/e2e.sh   # real git repos/worktrees in a throwaway $HOME
+```
 
 ## License
 

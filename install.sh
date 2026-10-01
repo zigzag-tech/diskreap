@@ -25,6 +25,7 @@ echo "installed $bin"
 # Agent skill: link into every agent skill dir that exists.
 for d in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
   [ -d "$d" ] || continue
+  [ -e "$d/disk-cleanup" ] && continue # already provided (e.g. by a synced dotfiles repo)
   ln -sfn "$here/skills/disk-cleanup" "$d/disk-cleanup"
   echo "linked $d/disk-cleanup"
 done

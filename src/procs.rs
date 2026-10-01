@@ -29,7 +29,23 @@ impl InUse {
             u.lsof();
         }
         u.docker_mounts();
+        u.tmux_panes();
         u
+    }
+
+    /// Sandboxed agents are often non-dumpable: /proc/<pid>/cwd is unreadable
+    /// even for our own uid. Their terminal pane's cwd is not.
+    fn tmux_panes(&mut self) {
+        if which("tmux").is_none() {
+            return;
+        }
+        if let Some(o) = run(
+            &["tmux", "list-panes", "-a", "-F", "#{pane_current_path}"],
+            None,
+            Duration::from_secs(10),
+        ) {
+            o.stdout.lines().for_each(|l| self.add(l.trim()));
+        }
     }
 
     #[cfg(test)]

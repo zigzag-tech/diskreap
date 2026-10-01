@@ -171,7 +171,10 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             idle(t, last, cx.policy.build_idle_days)
         }
         "worktree" => {
-            git::linked_worktree_gitdir(p).ok_or("not a linked worktree")?;
+            let gitdir = git::linked_worktree_gitdir(p).ok_or("not a linked worktree")?;
+            if git::locked(&gitdir) {
+                return Err("locked (git worktree lock)".into());
+            }
             if let Some(h) = cx.inuse.under(p) {
                 return Err(format!("in use ({})", h.display()));
             }
@@ -186,6 +189,13 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             let base = git::base_ref(p).ok_or("no main/master/origin HEAD to compare with")?;
             if !git::merged_into(p, &base) {
                 return Err(format!("has commits not in {base}"));
+            }
+            if git::stash_names_branch(p) {
+                return Err("a stash entry names its branch".into());
+            }
+            let main = git::main_checkout(p).ok_or("main checkout not found")?;
+            if let Some(f) = git::ignored_data(p, &main) {
+                return Err(format!("holds ignored data not in the main checkout: {f}"));
             }
             let top_mtime = std::fs::read_dir(p)
                 .map(|rd| {
