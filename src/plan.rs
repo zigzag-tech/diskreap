@@ -4,7 +4,7 @@
 use crate::act;
 use crate::git;
 use crate::mounts::{self, Mount};
-use crate::procs::{InUse, Refs};
+use crate::procs::{InUse, Owners, Refs};
 use crate::rules::{Rules, Strat, CACHES, REPORT_ONLY};
 use crate::util::{self, fs_space, now, which, DAY, GB};
 use crate::walk::{self, Opts};
@@ -83,10 +83,21 @@ pub fn home_target(total: u64) -> u64 {
     target_with_floor(total, util::min_free_bytes())
 }
 
+/// The fast merged-worktree rule never goes below this: a tree touched in the last half hour is live.
+pub const MIN_MERGED_IDLE_MINUTES: i64 = 30;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Policy {
     pub build_idle_days: i64,
     pub worktree_idle_days: i64,
+    /// Operator fast rule (`worktree_merged_idle_minutes`): a CLEAN worktree whose HEAD is a strict
+    /// ancestor of origin's default branch is removable after this many minutes idle instead of
+    /// `worktree_idle_days`. None = off.
+    #[serde(default)]
+    pub worktree_merged_idle_minutes: Option<i64>,
+    /// Globs on the worktree's branch name (`protect_worktree_branches`): never removed.
+    #[serde(default)]
+    pub protect_worktree_branches: Vec<String>,
     pub log_min_bytes: u64,
     pub log_idle_hours: i64,
     /// Percent of each cache's normal age horizon.
@@ -103,6 +114,8 @@ impl Policy {
             Level::Critical => Policy {
                 build_idle_days: 1,
                 worktree_idle_days: 1,
+                worktree_merged_idle_minutes: None,
+                protect_worktree_branches: vec![],
                 log_min_bytes: 100 << 20,
                 log_idle_hours: 6,
                 cache_age_pct: 25,
@@ -114,6 +127,8 @@ impl Policy {
             Level::Ok => Policy {
                 build_idle_days: 14,
                 worktree_idle_days: 7,
+                worktree_merged_idle_minutes: None,
+                protect_worktree_branches: vec![],
                 log_min_bytes: 1 << 30,
                 log_idle_hours: 7 * 24,
                 cache_age_pct: 200,
@@ -124,6 +139,8 @@ impl Policy {
             Level::Low => Policy {
                 build_idle_days: 3,
                 worktree_idle_days: 3,
+                worktree_merged_idle_minutes: None,
+                protect_worktree_branches: vec![],
                 log_min_bytes: 500 << 20,
                 log_idle_hours: 24,
                 cache_age_pct: 100,
@@ -132,6 +149,37 @@ impl Policy {
                 docker_unused_images: false,
             },
         }
+    }
+
+    /// Fill the operator-config fields (`worktree_merged_idle_minutes`,
+    /// `protect_worktree_branches`). Malformed values are a loud exit 2, like every other key.
+    pub fn with_operator_config(mut self) -> Policy {
+        let Some(cfg) = util::config_json() else { return self };
+        let bad = |what: &str| -> ! {
+            eprintln!("diskreap: config {what}");
+            std::process::exit(2)
+        };
+        self.worktree_merged_idle_minutes = None;
+        if let Some(v) = cfg.get("worktree_merged_idle_minutes") {
+            match v.as_i64() {
+                Some(m) if m >= MIN_MERGED_IDLE_MINUTES => self.worktree_merged_idle_minutes = Some(m),
+                _ => bad(&format!(
+                    "worktree_merged_idle_minutes must be an integer >= {MIN_MERGED_IDLE_MINUTES} (minutes), got {v}"
+                )),
+            }
+        }
+        self.protect_worktree_branches.clear();
+        if let Some(v) = cfg.get("protect_worktree_branches") {
+            let Some(arr) = v.as_array() else { bad("protect_worktree_branches must be an array of glob strings") };
+            for g in arr {
+                let Some(g) = g.as_str() else { bad("protect_worktree_branches must be an array of glob strings") };
+                if glob::Pattern::new(g).is_err() {
+                    bad(&format!("protect_worktree_branches: bad glob {g:?}"));
+                }
+                self.protect_worktree_branches.push(g.to_string());
+            }
+        }
+        self
     }
 
     pub fn cache_days(&self, days: i64) -> i64 {
@@ -150,6 +198,21 @@ pub struct Item {
     pub why: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheRef>,
+}
+
+/// A worktree diskreap will not touch because it holds work: uncommitted changes or unmerged commits.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ReviewWt {
+    pub path: String,
+    pub bytes: u64,
+    pub newest: i64,
+    pub branch: String,
+    /// "dirty" | "unmerged" (unmerged wins when both hold).
+    pub kind: String,
+    /// e.g. "12 uncommitted" or "3 commits not in origin/main, 5 uncommitted".
+    pub state: String,
+    /// Best-effort holder: process cwd / tmux pane / git lock reason, or "-".
+    pub owner: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -175,6 +238,9 @@ pub struct Plan {
     #[serde(default)]
     pub phase_secs: Vec<(String, f64)>,
     pub items: Vec<Item>,
+    /// Dirty or unmerged worktrees (scan only): never deleted, listed so a human decides.
+    #[serde(default)]
+    pub review: Vec<ReviewWt>,
     /// Largest directories (full scan): (path, bytes, newest mtime).
     pub top: Vec<(String, u64, i64)>,
     pub stalled: Vec<String>,
@@ -293,24 +359,34 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
                 // longer vouch for the files — a person must look.
                 return Err("orphaned worktree (its git admin dir is gone)".into());
             }
+            if let Some(b) = git::branch(p) {
+                if let Some(g) = cx
+                    .policy
+                    .protect_worktree_branches
+                    .iter()
+                    .find(|g| glob::Pattern::new(g).is_ok_and(|pt| pt.matches(&b)))
+                {
+                    return Err(format!("branch {b} protected by protect_worktree_branches {g}"));
+                }
+            }
             // Cheapest decisive checks first: on a busy host most worktrees are
             // active, and `git status` over 300 of them took 226 s (xc-tower-ubuntu).
-            let top_mtime = std::fs::read_dir(p)
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| util::mtime_of(&e.path()))
-                        .max()
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-            // Detached HEAD is often a deliberate pin (referenced by path elsewhere): wait much longer.
-            let days = if git::detached(p) {
-                cx.policy.worktree_idle_days.max(30)
-            } else {
-                cx.policy.worktree_idle_days
-            };
-            idle(t, it.newest.max(git::activity(p)).max(top_mtime), days)?;
+            let last = worktree_last_active(p, it.newest);
+            let (window, fast) = worktree_window(p, cx.policy);
+            if t - last < window {
+                return Err(format!("active {} ago (< {})", util::ago(last), human_window(window)));
+            }
             let base = git::base_ref(p).ok_or("no main/master/origin HEAD to compare with")?;
+            if fast && t - last < worktree_slow_window(p, cx.policy) {
+                // The fast rule leans on the remote's word, not on a local branch that may
+                // hold unpushed merges: origin's already-fetched default branch, strict ancestry.
+                if !base.starts_with("origin/") {
+                    return Err(format!("fast rule needs an origin/ default branch ref; only {base} exists"));
+                }
+                if !git::is_ancestor(p, &base) {
+                    return Err(format!("HEAD is not an ancestor of {base} (fast rule needs a plain merge)"));
+                }
+            }
             if !git::merged_into(p, &base) {
                 return Err(format!("has commits not in {base}"));
             }
@@ -374,6 +450,59 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             .ok_or_else(|| "docker not installed".into()),
         _ => Err("report only".into()),
     }
+}
+
+/// Newest sign of work in a worktree, cheaply: the walk's newest mtime, git's own
+/// metadata (index/HEAD/reflog) and the top-level entries' mtimes.
+fn worktree_last_active(p: &Path, walked_newest: i64) -> i64 {
+    let top_mtime = std::fs::read_dir(p)
+        .map(|rd| rd.flatten().map(|e| util::mtime_of(&e.path())).max().unwrap_or(0))
+        .unwrap_or(0);
+    walked_newest.max(git::activity(p)).max(top_mtime)
+}
+
+/// Detached HEAD is often a deliberate pin (referenced by path elsewhere): wait much longer.
+fn worktree_slow_window(p: &Path, policy: &Policy) -> i64 {
+    let days = if git::detached(p) {
+        policy.worktree_idle_days.max(30)
+    } else {
+        policy.worktree_idle_days
+    };
+    days * DAY
+}
+
+/// (idle seconds required, whether the operator's fast rule set it).
+fn worktree_window(p: &Path, policy: &Policy) -> (i64, bool) {
+    let slow = worktree_slow_window(p, policy);
+    match policy.worktree_merged_idle_minutes {
+        Some(m) if m * 60 < slow && !git::detached(p) => (m * 60, true),
+        _ => (slow, false),
+    }
+}
+
+fn human_window(secs: i64) -> String {
+    if secs % DAY == 0 {
+        format!("{}d", secs / DAY)
+    } else if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+/// Why an OK worktree will be removed, for the dry-run line.
+fn worktree_reason(it: &Item, cx: &Ctx) -> String {
+    let p = Path::new(&it.path);
+    let last = worktree_last_active(p, it.newest);
+    let base = git::base_ref(p).unwrap_or_default();
+    let (window, fast) = worktree_window(p, cx.policy);
+    let branch = git::branch(p).map(|b| format!("branch {b} kept, ")).unwrap_or_default();
+    format!(
+        "clean, merged into {base}, idle {} (needs {}{}); {branch}no process inside",
+        util::ago(last),
+        human_window(window),
+        if fast { ", worktree_merged_idle_minutes" } else { "" },
+    )
 }
 
 fn idle(t: i64, last: i64, days: i64) -> Result<(), String> {
@@ -486,13 +615,73 @@ pub struct ScanOpts {
     pub level: Level,
     pub root: Option<PathBuf>,
     pub threads: usize,
+    /// Also classify (and size) the worktrees that hold work. Costs a `git status` per
+    /// worktree, so `scan` asks for it and the hourly `auto` does not.
+    pub review: bool,
+}
+
+/// Classify the skipped worktrees that hold work. Reasons already name dirty/unmerged
+/// for the ones that got far enough; the rest (active, in use, locked…) are probed.
+fn review_worktrees(wts: &[Item], mounts: &[Mount]) -> Vec<ReviewWt> {
+    let owners = Owners::snapshot();
+    let cands: Vec<&Item> = wts
+        .iter()
+        .filter(|i| !i.ok)
+        .filter(|i| !i.why.starts_with("referenced by") && !i.why.starts_with("branch ") && !i.why.starts_with("orphaned"))
+        .collect();
+    let out = std::sync::Mutex::new(Vec::new());
+    let n = cands.len().div_ceil(8).max(1);
+    std::thread::scope(|s| {
+        for chunk in cands.chunks(n) {
+            let (owners, out) = (&owners, &out);
+            s.spawn(move || {
+                for it in chunk {
+                    let p = Path::new(&it.path);
+                    let Some(base) = git::base_ref(p) else { continue };
+                    let ahead = if it.why.starts_with("has commits not in") || !git::merged_into(p, &base) {
+                        Some(git::commits_not_in(p, &base))
+                    } else {
+                        None
+                    };
+                    let dirty = match it.why.split_once(' ') {
+                        Some((n, rest)) if rest.starts_with("uncommitted/untracked") => n.parse().ok(),
+                        _ => git::dirty_count(p),
+                    }
+                    .unwrap_or(0);
+                    if ahead.is_none() && dirty == 0 {
+                        continue;
+                    }
+                    let mut parts = Vec::new();
+                    if let Some(a) = ahead {
+                        parts.push(format!("{a} commit(s) not in {base}"));
+                    }
+                    if dirty > 0 {
+                        parts.push(format!("{dirty} uncommitted"));
+                    }
+                    let gitdir = git::linked_worktree_gitdir(p);
+                    out.lock().unwrap().push(ReviewWt {
+                        path: it.path.clone(),
+                        bytes: act::du(p, mounts),
+                        newest: worktree_last_active(p, it.newest),
+                        branch: git::branch(p).unwrap_or_else(|| "(detached)".into()),
+                        kind: if ahead.is_some() { "unmerged" } else { "dirty" }.into(),
+                        state: parts.join(", "),
+                        owner: owners.of(p, gitdir.as_deref()),
+                    });
+                }
+            });
+        }
+    });
+    let mut v = out.into_inner().unwrap();
+    v.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    v
 }
 
 pub fn scan(o: &ScanOpts) -> Plan {
     let started = Instant::now();
     let home = util::home();
     let root = o.root.clone().unwrap_or_else(|| home.clone());
-    let policy = Policy::for_level(o.level);
+    let policy = Policy::for_level(o.level).with_operator_config();
     let mounts = mounts::list();
     let (total, avail) = fs_space(&home).unwrap_or((0, 0));
 
@@ -542,6 +731,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         .collect();
     let mut wts = verdicts(wts, &cx);
     for it in wts.iter_mut().filter(|i| i.ok) {
+        it.why = worktree_reason(it, &cx);
         let sized = w
             .found
             .iter()
@@ -550,6 +740,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
             it.bytes = act::du(Path::new(&it.path), &mounts); // quick scan sizes eligible ones only
         }
     }
+    let review = if o.review { review_worktrees(&wts, &mounts) } else { Vec::new() };
     let ok_worktrees: Vec<PathBuf> = wts
         .iter()
         .filter(|i| i.ok)
@@ -730,6 +921,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         scan_secs: started.elapsed().as_secs_f64(),
         phase_secs: phases,
         items,
+        review,
         top,
         stalled: s(&w.stalled),
         skipped_mounts: s(&w.skipped_mounts),

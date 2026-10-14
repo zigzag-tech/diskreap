@@ -20,6 +20,7 @@ printf 'artifacts/\nnode_modules/\n*.log\n.env\nvenv/\n' >.gitignore
 echo '{}' >package.json
 echo 'A=1' >.env
 git add .gitignore package.json && git commit -qm init
+git init -q --bare ../origin.git && git remote add origin ../origin.git && git push -q origin main   # origin/main, as agents' clones have
 big node_modules/a/big 30M
 big artifacts/run1/hub/node_modules/x/big 20M
 echo '{}' >artifacts/run1/hub/package.json   # a staged release copy carries its manifest
@@ -34,6 +35,10 @@ wt wt-locked && git worktree lock ../wt-locked
 wt wt-envdiff && echo 'A=2' >../wt-envdiff/.env
 wt wt-envsame && cp .env ../wt-envsame/.env
 git worktree add -q --detach ../wt-detached
+# Fast-rule fixtures (aged 3 hours below, not 60 days): clean+merged, dirty, protected-by-branch, unmerged.
+wt wt-recent; wt wt-recentdirty; wt keepme-recent; wt wt-recentahead
+echo z >>../wt-recentdirty/package.json
+(cd ../wt-recentahead && echo a >g && git add g && git commit -qm ahead)
 big ../wt-merged/node_modules/z/big 15M
 
 # A project whose venv an (absent) service references: protected.
@@ -74,10 +79,13 @@ find "$H" "$T/tmp" -mindepth 1 -exec touch -h -a -m -d '60 days ago' {} +
 chmod -R a-w "$H/repo/artifacts/run1/hub"
 touch -a "$H/.cache/huggingface/hub/models--new/w"
 touch "$H/active/.git/index"   # someone ran git there just now
+for w in wt-recent wt-recentdirty keepme-recent wt-recentahead; do   # worked on 3 hours ago: idle for the fast rule, not for the 3d rule
+  find "$H/$w" "$H/repo/.git/worktrees/$w" -exec touch -h -a -m -d '3 hours ago' {} +
+done
 
 cd /
 DISKREAP_DEBUG=1 "$B" scan --level low --json >"$T/plan.json"
-v() { local p="$1"; [[ "$p" == /* ]] || p="$H/$p"; jq -r --arg p "$p" '.items[] | select(.path==$p) | if .ok then "ok" else "skip: " + .why end' "$T/plan.json"; }
+v() { local p="$1"; [[ "$p" == /* ]] || p="$H/$p"; jq -r --arg p "$p" '.items[] | select(.path==$p) | if .ok then "ok" else "skip: " + .why end' "${PLAN:-$T/plan.json}"; }
 fail=0
 expect() {
   local got; got="$(v "$1")"
@@ -93,6 +101,7 @@ expect wt-locked "skip: locked"
 expect wt-envdiff "skip: holds ignored data"
 expect wt-envsame ok
 expect wt-detached ok # 60d idle > 30d pin horizon
+expect wt-recent "skip: active"   # no worktree_merged_idle_minutes configured: the 3d rule holds
 expect svc/venv "skip: project referenced by"
 expect plain/node_modules "skip: no project manifest"
 expect .local/share/uv/tools/ytdl "skip: inside an installation root"
@@ -123,6 +132,27 @@ kept repo/app.log
 gone "$T/tmp/stale-build"
 [ -S "$T/tmp/live-session/sock" ] && echo "ok    live-session socket kept" || { echo "FAIL  socket dir removed"; fail=1; }
 git -C "$H/repo" rev-parse -q --verify wt-merged >/dev/null && echo "ok    branch wt-merged kept" || { echo "FAIL  branch deleted"; fail=1; }
+# Fast rule: worktree_merged_idle_minutes + protect_worktree_branches (config file), scan then dry run then apply.
+echo '{"worktree_merged_idle_minutes": 60, "protect_worktree_branches": ["keepme-*"]}' >"$T/fast.json"
+DISKREAP_CONFIG="$T/fast.json" "$B" scan --level low --json >"$T/plan2.json"
+PLAN="$T/plan2.json"
+expect wt-recent ok
+expect wt-recentdirty "skip: 1 uncommitted"
+expect wt-recentahead "skip: HEAD is not an ancestor"
+expect keepme-recent "skip: branch keepme-recent protected"
+[ "$(jq -r '[.review[] | select(.path|endswith("wt-recentdirty")) | .kind] | first' "$T/plan2.json")" = dirty ] && echo "ok    review lists the dirty worktree" || { echo "FAIL  review: dirty"; fail=1; }
+[ "$(jq -r '[.review[] | select(.path|endswith("wt-recentahead")) | .kind] | first' "$T/plan2.json")" = unmerged ] && echo "ok    review lists the unmerged worktree" || { echo "FAIL  review: unmerged"; fail=1; }
+[ "$(jq -r '[.review[] | select(.path|endswith("wt-recent") or endswith("keepme-recent"))] | length' "$T/plan2.json")" = 0 ] && echo "ok    review omits clean merged worktrees" || { echo "FAIL  review: clean listed"; fail=1; }
+DISKREAP_CONFIG="$T/fast.json" "$B" clean -c worktree >"$T/dry.txt"
+grep -q "would remove-worktree.*wt-recent .*branch wt-recent kept" "$T/dry.txt" && echo "ok    dry run says why" || { echo "FAIL  dry run reason"; cat "$T/dry.txt"; fail=1; }
+DISKREAP_CONFIG="$T/fast.json" "$B" scan --level low | grep -q "WORKTREES NEEDING A HUMAN" && echo "ok    scan prints the report section" || { echo "FAIL  report section"; fail=1; }
+DISKREAP_CONFIG="$T/fast.json" "$B" clean --apply -c worktree >/dev/null
+gone wt-recent
+kept wt-recentdirty; kept wt-recentahead; kept keepme-recent
+git -C "$H/repo" rev-parse -q --verify wt-recent >/dev/null && echo "ok    fast rule keeps the branch" || { echo "FAIL  fast rule deleted branch"; fail=1; }
+echo '{"worktree_merged_idle_minutes": 5}' >"$T/bad.json"
+rc=0; DISKREAP_CONFIG="$T/bad.json" "$B" scan >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "ok    worktree_merged_idle_minutes below the floor exits 2" || { echo "FAIL  bad minutes rc=$rc"; fail=1; }
 # Operator free-space floor. The scratch fs may have more than half free (a floor is capped at half
 # the filesystem), so assert on the auto target, which a floor always raises: floor + 25%.
 tgt() { "$B" status --json | sed -n 's/.*"target_avail_bytes":\([0-9]*\).*/\1/p'; }

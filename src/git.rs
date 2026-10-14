@@ -105,6 +105,25 @@ pub fn base_ref(wt: &Path) -> Option<String> {
         .map(|r| r.to_string())
 }
 
+/// The checked-out branch, None when detached.
+pub fn branch(wt: &Path) -> Option<String> {
+    line(wt, &["symbolic-ref", "-q", "--short", "HEAD"])
+}
+
+/// HEAD is a (strict, no patch-equivalence) ancestor of `base`.
+pub fn is_ancestor(wt: &Path, base: &str) -> bool {
+    git(wt, &["merge-base", "--is-ancestor", "HEAD", base])
+        .map(|o| o.ok)
+        .unwrap_or(false)
+}
+
+/// Commits on HEAD that `base` lacks.
+pub fn commits_not_in(wt: &Path, base: &str) -> usize {
+    line(wt, &["rev-list", "--count", "HEAD", "--not", base])
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Every commit on HEAD is in `base` — directly or as a patch-equivalent (rebased) copy.
 pub fn merged_into(wt: &Path, base: &str) -> bool {
     if git(wt, &["merge-base", "--is-ancestor", "HEAD", base])

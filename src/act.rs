@@ -443,12 +443,14 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
     let mounts = mounts::list();
     let inuse = InUse::snapshot();
     let refs = Refs::collect(&home);
+    // Operator protections are read live: editing the config between scan and clean applies.
+    let policy = plan.policy.clone().with_operator_config();
     let cx = Ctx {
         tmp_idle_days: plan::tmp_idle_days(plan.level),
         home: &home,
         inuse: &inuse,
         refs: &refs,
-        policy: &plan.policy,
+        policy: &policy,
         mounts: &mounts,
     };
     let avail = || fs_space(&home).map(|s| s.1).unwrap_or(0);
@@ -465,11 +467,13 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
                     println!("  skip    {:<12} {}  ({note})", it.cat, it.path);
                 } else {
                     println!(
-                        "  {verb}{action:<8} {:<12} {}  ({}){}",
+                        "  {verb}{action:<8} {:<12} {}  ({}){}{}",
                         it.cat,
                         it.path,
                         human(est),
-                        if ok { "" } else { "  FAILED" }
+                        if ok { "" } else { "  FAILED" },
+                        // A worktree removal must say why it is safe, in the dry run above all.
+                        if it.cat == "worktree" && !it.why.is_empty() { format!("  — {}", it.why) } else { String::new() }
                     );
                 }
             }

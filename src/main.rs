@@ -114,6 +114,7 @@ fn main() {
                 level: lvl,
                 root: None,
                 threads: THREADS,
+                review: true,
             });
             plan.save();
             if json {
@@ -263,6 +264,14 @@ fn status(hook: bool, json: bool) {
             ago(p.created),
             human(p.reclaimable())
         );
+        if !p.review.is_empty() {
+            let total: u64 = p.review.iter().map(|r| r.bytes).sum();
+            println!(
+                "worktrees needing a human (report only): {} holding {} — `diskreap scan` lists them",
+                p.review.len(),
+                human(total)
+            );
+        }
     }
 }
 
@@ -304,6 +313,7 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
             level: home_lvl,
             root: None,
             threads: THREADS,
+            review: false,
         });
         plan.save();
         println!(
@@ -398,11 +408,13 @@ fn print_plan(p: &Plan, verbose: bool) {
         for i in no
             .iter()
             .filter(|_| show_skips)
+            .filter(|i| !p.review.iter().any(|r| r.path == i.path)) // listed below, with owners
             .take(if verbose { usize::MAX } else { 15 })
         {
             println!("  {:>8}  {}  — {}", human(i.bytes), i.path, i.why);
         }
     }
+    print_review(p, verbose);
     if !p.top.is_empty() {
         println!("\nLARGEST DIRECTORIES:");
         for (path, b, n) in p.top.iter().take(15) {
@@ -429,6 +441,37 @@ fn print_plan(p: &Plan, verbose: bool) {
         human(p.reclaimable()),
         if p.mode == "quick" { " (quick scan; `--full` finds deeper items)" } else { "" }
     );
+}
+
+/// Dirty and unmerged worktrees: never deleted by diskreap, so say so loudly instead of
+/// letting "0 B reclaimable" read as "nothing here".
+fn print_review(p: &Plan, verbose: bool) {
+    if p.review.is_empty() {
+        return;
+    }
+    let total: u64 = p.review.iter().map(|r| r.bytes).sum();
+    let unmerged = p.review.iter().filter(|r| r.kind == "unmerged").count();
+    println!(
+        "\nWORKTREES NEEDING A HUMAN (report only, never deleted): {} holding {} ({} dirty, {unmerged} unmerged)",
+        p.review.len(),
+        human(total),
+        p.review.len() - unmerged
+    );
+    for r in p.review.iter().take(if verbose { usize::MAX } else { 15 }) {
+        println!(
+            "  {:>8}  {:<8}  {:>4} ago  {}  [{}]  owner: {}  {}",
+            human(r.bytes),
+            r.kind,
+            ago(r.newest),
+            r.branch,
+            r.state,
+            r.owner,
+            r.path
+        );
+    }
+    if p.review.len() > 15 && !verbose {
+        println!("  … {} more (-v)", p.review.len() - 15);
+    }
 }
 
 fn du(p: PathBuf, depth: usize, top: usize) {

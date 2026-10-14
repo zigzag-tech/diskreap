@@ -378,6 +378,65 @@ mod refs_tests {
     }
 }
 
+/// Best-effort "who is working here": processes whose cwd is inside a directory
+/// (Linux /proc) and tmux panes whose current path is. Used only to label the
+/// worktree report; never to decide anything.
+#[derive(Default)]
+pub struct Owners {
+    cwds: Vec<(PathBuf, String)>,
+}
+
+impl Owners {
+    pub fn snapshot() -> Owners {
+        let mut o = Owners::default();
+        if cfg!(target_os = "linux") {
+            if let Ok(rd) = std::fs::read_dir("/proc") {
+                for e in rd.flatten() {
+                    let pid = e.file_name().to_string_lossy().into_owned();
+                    if !pid.bytes().all(|b| b.is_ascii_digit()) {
+                        continue;
+                    }
+                    let Ok(cwd) = std::fs::read_link(e.path().join("cwd")) else { continue };
+                    let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+                    o.cwds.push((cwd, format!("{} pid {pid}", comm.trim())));
+                }
+            }
+        }
+        if which("tmux").is_some() {
+            if let Some(out) = run(
+                &["tmux", "list-panes", "-a", "-F", "#{pane_current_path}\t#{session_name}:#{window_index}.#{pane_index} #{pane_current_command}"],
+                None,
+                Duration::from_secs(10),
+            ) {
+                for l in out.stdout.lines() {
+                    if let Some((path, label)) = l.split_once('\t') {
+                        o.cwds.push((PathBuf::from(path), format!("tmux {label}")));
+                    }
+                }
+            }
+        }
+        o
+    }
+
+    /// Up to three distinct labels of holders at or below `dir`, then the worktree lock reason if any.
+    pub fn of(&self, dir: &Path, gitdir: Option<&Path>) -> String {
+        let mut v: Vec<String> = Vec::new();
+        for (p, l) in &self.cwds {
+            if p.starts_with(dir) && !v.contains(l) {
+                v.push(l.clone());
+            }
+        }
+        v.truncate(3);
+        if let Some(g) = gitdir {
+            if let Ok(r) = std::fs::read_to_string(g.join("locked")) {
+                let r = r.trim();
+                v.push(if r.is_empty() { "git-locked".into() } else { format!("git-locked: {r}") });
+            }
+        }
+        if v.is_empty() { "-".into() } else { v.join(", ") }
+    }
+}
+
 #[cfg(test)]
 mod protect_tests {
     use super::*;
