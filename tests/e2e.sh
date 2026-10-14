@@ -123,4 +123,14 @@ kept repo/app.log
 gone "$T/tmp/stale-build"
 [ -S "$T/tmp/live-session/sock" ] && echo "ok    live-session socket kept" || { echo "FAIL  socket dir removed"; fail=1; }
 git -C "$H/repo" rev-parse -q --verify wt-merged >/dev/null && echo "ok    branch wt-merged kept" || { echo "FAIL  branch deleted"; fail=1; }
+# Operator free-space floor. The scratch fs may have more than half free (a floor is capped at half
+# the filesystem), so assert on the auto target, which a floor always raises: floor + 25%.
+tgt() { "$B" status --json | sed -n 's/.*"target_avail_bytes":\([0-9]*\).*/\1/p'; }
+base=$(tgt)
+[ "$(DISKREAP_MIN_FREE_GIB=100000000 tgt)" -gt "$base" ] && echo "ok    min_free_gib env raises the auto target" || { echo "FAIL  env floor"; fail=1; }
+mkdir -p "$H/.config/diskreap" && echo '{"min_free_gib": 100000000}' >"$H/.config/diskreap/config.json"
+[ "$(tgt)" -gt "$base" ] && echo "ok    min_free_gib config file raises the auto target" || { echo "FAIL  config floor"; fail=1; }
+rm "$H/.config/diskreap/config.json"
+rc=0; DISKREAP_MIN_FREE_GIB=lots "$B" status >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] && echo "ok    malformed min_free_gib exits 2" || { echo "FAIL  malformed floor rc=$rc"; fail=1; }
 exit $fail

@@ -125,6 +125,49 @@ pub fn state_dir() -> PathBuf {
     d
 }
 
+/// Operator-set free-space floor for `$HOME`'s filesystem, in bytes, or None.
+/// `DISKREAP_MIN_FREE_GIB` wins over `min_free_gib` in the JSON config file
+/// (`$DISKREAP_CONFIG`, default `~/.config/diskreap/config.json`). A host that
+/// keeps a large working set (an object store, build caches) sets it above the
+/// built-in thresholds so cleanup starts before that store is refused space.
+/// A malformed value is a loud exit, never a silent fallback to the defaults.
+pub fn min_free_bytes() -> Option<u64> {
+    let (raw, src) = match std::env::var("DISKREAP_MIN_FREE_GIB") {
+        Ok(v) => (v, "DISKREAP_MIN_FREE_GIB".to_string()),
+        Err(_) => {
+            let path = std::env::var_os("DISKREAP_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".config/diskreap/config.json"));
+            let text = std::fs::read_to_string(&path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+                eprintln!("diskreap: {} is not valid JSON: {e}", path.display());
+                std::process::exit(2)
+            });
+            (
+                v.get("min_free_gib")?.to_string(),
+                format!("min_free_gib in {}", path.display()),
+            )
+        }
+    };
+    parse_min_free_gib(&raw).unwrap_or_else(|| {
+        eprintln!("diskreap: {src} must be a positive number of GiB, got {raw:?}");
+        std::process::exit(2)
+    })
+}
+
+/// Some(Some(bytes)) for a positive number, Some(None) for 0 / empty (unset), None if malformed.
+fn parse_min_free_gib(raw: &str) -> Option<Option<u64>> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Some(None);
+    }
+    let v: f64 = t.parse().ok()?;
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    Some((v > 0.0).then(|| (v * GB as f64) as u64))
+}
+
 /// Exclusive non-blocking lock held for the life of the returned file.
 pub fn try_lock(name: &str) -> Option<std::fs::File> {
     let f = std::fs::OpenOptions::new()
@@ -140,4 +183,20 @@ pub fn mtime_of(p: &Path) -> i64 {
     std::fs::symlink_metadata(p)
         .map(|m| crate::platform::mtime(&m))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_free_parsing() {
+        assert_eq!(parse_min_free_gib("120"), Some(Some(120 * GB)));
+        assert_eq!(parse_min_free_gib(" 0.5 "), Some(Some(GB / 2)));
+        assert_eq!(parse_min_free_gib("0"), Some(None));
+        assert_eq!(parse_min_free_gib(""), Some(None));
+        assert_eq!(parse_min_free_gib("-1"), None);
+        assert_eq!(parse_min_free_gib("lots"), None);
+        assert_eq!(parse_min_free_gib("\"120\""), None);
+    }
 }

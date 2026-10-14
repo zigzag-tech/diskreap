@@ -50,6 +50,39 @@ pub fn target_avail(total: u64) -> u64 {
     clamp_share(total, 20, 15 * GB, 40, 150 * GB)
 }
 
+/// The operator's free-space floor (`util::min_free_bytes`), capped at half the filesystem
+/// so a typo cannot make a small disk permanently "low".
+fn effective_floor(total: u64, floor: Option<u64>) -> Option<u64> {
+    floor.map(|f| f.min(total / 2))
+}
+
+/// `level_of` for `$HOME`'s filesystem, with the operator floor: free space below it is at
+/// least Low. It never lowers a level and never creates Critical.
+pub fn level_with_floor(total: u64, avail: u64, floor: Option<u64>) -> Level {
+    let base = level_of(total, avail);
+    match effective_floor(total, floor) {
+        Some(f) if base == Level::Ok && avail < f => Level::Low,
+        _ => base,
+    }
+}
+
+/// `auto` target for `$HOME`'s filesystem: the built-in target, or 25% above the floor.
+pub fn target_with_floor(total: u64, floor: Option<u64>) -> u64 {
+    let t = target_avail(total);
+    match effective_floor(total, floor) {
+        Some(f) => t.max(f + f / 4),
+        None => t,
+    }
+}
+
+pub fn home_level(total: u64, avail: u64) -> Level {
+    level_with_floor(total, avail, util::min_free_bytes())
+}
+
+pub fn home_target(total: u64) -> u64 {
+    target_with_floor(total, util::min_free_bytes())
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Policy {
     pub build_idle_days: i64,
@@ -408,7 +441,8 @@ pub struct FsState {
 pub fn watched_filesystems() -> Vec<FsState> {
     let mut out: Vec<FsState> = Vec::new();
     let mut seen: Vec<(u64, u64)> = Vec::new();
-    for p in std::iter::once(util::home()).chain(tmp_roots()) {
+    let home = util::home();
+    for p in std::iter::once(home.clone()).chain(tmp_roots()) {
         let Some((t, a)) = fs_space(&p) else { continue };
         // Same size and (nearly) same free space ≈ same filesystem; cheap and portable.
         if seen
@@ -422,7 +456,8 @@ pub fn watched_filesystems() -> Vec<FsState> {
             path: p.to_string_lossy().into_owned(),
             total_bytes: t,
             avail_bytes: a,
-            level: level_of(t, a),
+            // The operator floor describes $HOME's filesystem only, not a tmpfs.
+            level: if p == home { home_level(t, a) } else { level_of(t, a) },
         });
     }
     out
@@ -687,7 +722,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
         } else {
             "quick".into()
         },
-        level: level_of(total, avail),
+        level: home_level(total, avail),
         policy,
         home: home.to_string_lossy().into_owned(),
         total,
@@ -772,6 +807,24 @@ mod tests {
         assert_eq!(level_of(tmpfs, 8 * GB), Level::Ok);
         assert_eq!(level_of(tmpfs, 3 * GB), Level::Low);
         assert_eq!(level_of(tmpfs, GB), Level::Critical);
+    }
+
+    #[test]
+    fn operator_floor() {
+        let t = 1800 * GB;
+        // Default: 110 GiB free is Ok on a big disk (low is below 100 GiB).
+        assert_eq!(level_with_floor(t, 110 * GB, None), Level::Ok);
+        // Floor 120 GiB: the same disk is Low, and target rises to 150 GiB (floor + 25%).
+        assert_eq!(level_with_floor(t, 110 * GB, Some(120 * GB)), Level::Low);
+        assert_eq!(level_with_floor(t, 125 * GB, Some(120 * GB)), Level::Ok);
+        assert_eq!(target_with_floor(t, Some(120 * GB)), 150 * GB);
+        assert_eq!(target_with_floor(t, Some(200 * GB)), 250 * GB);
+        // Never lowers a level, never makes Critical.
+        assert_eq!(level_with_floor(t, 29 * GB, Some(10 * GB)), Level::Critical);
+        assert_eq!(level_with_floor(t, 50 * GB, Some(10 * GB)), Level::Low);
+        assert_eq!(level_with_floor(t, 50 * GB, Some(500 * GB)), Level::Low);
+        // A floor larger than half the disk is capped: a 100 GiB disk with 60 free stays Ok.
+        assert_eq!(level_with_floor(100 * GB, 60 * GB, Some(500 * GB)), Level::Ok);
     }
 
     #[test]

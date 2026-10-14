@@ -9,7 +9,7 @@ mod util;
 mod walk;
 
 use clap::{Parser, Subcommand};
-use plan::{level_of, target_avail, Level, Plan, ScanOpts};
+use plan::{home_level, home_target, Level, Plan, ScanOpts};
 use std::path::PathBuf;
 use util::{ago, fs_space, home, human, now};
 
@@ -203,20 +203,20 @@ fn lock_or_exit(name: &str) -> std::fs::File {
 
 fn current_level() -> Level {
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
-    level_of(t, a)
+    home_level(t, a)
 }
 
 fn status(hook: bool, json: bool) {
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
     let fss = plan::watched_filesystems();
-    let worst = fss.iter().map(|f| f.level).max().unwrap_or(level_of(t, a));
+    let worst = fss.iter().map(|f| f.level).max().unwrap_or(home_level(t, a));
     if json {
         // Top-level numbers stay $HOME's filesystem; `level` is the worst watched one.
         println!(
             "{}",
             serde_json::json!({
                 "host": util::hostname(), "home": home(), "total_bytes": t, "avail_bytes": a,
-                "level": worst, "home_level": level_of(t, a), "target_avail_bytes": target_avail(t),
+                "level": worst, "home_level": home_level(t, a), "target_avail_bytes": home_target(t),
                 "filesystems": fss, "version": env!("CARGO_PKG_VERSION"),
             })
         );
@@ -255,7 +255,7 @@ fn status(hook: bool, json: bool) {
             f.level
         );
     }
-    println!("auto target for $HOME: {}", human(target_avail(t)));
+    println!("auto target for $HOME: {}", human(home_target(t)));
     if let Some(p) = Plan::load() {
         println!(
             "last plan: {} scan {} ago, {} reclaimable",
@@ -269,36 +269,39 @@ fn status(hook: bool, json: bool) {
 fn auto(dry_run: bool, force: bool, min_level: Level) {
     let _lock = lock_or_exit("auto.lock");
     let (t, a) = fs_space(&home()).unwrap_or((0, 0));
-    let home_level = level_of(t, a);
+    let home_lvl = home_level(t, a);
     let worst = plan::watched_filesystems()
         .iter()
         .map(|f| f.level)
         .max()
-        .unwrap_or(home_level);
+        .unwrap_or(home_lvl);
     println!(
         "[{}] {}: {} free in $HOME ({:?}); worst watched filesystem {:?}",
         now(),
         util::hostname(),
         human(a),
-        home_level,
+        home_lvl,
         worst
     );
-    if worst < min_level && !force {
+    // Below the operator floor (min_free_gib) the guard acts at `low` even when the timer
+    // is critical-only: that is the point of setting a floor above the built-in thresholds.
+    let floor_breached = util::min_free_bytes().is_some_and(|f| a < f.min(t / 2));
+    if worst < min_level && !force && !floor_breached {
         return;
     }
     // Only a temp filesystem is under pressure: clean temp entries (judged by
     // that filesystem's level), not $HOME by $HOME's healthy policy.
-    let tmp_only = home_level < min_level && !force;
+    let tmp_only = home_lvl < min_level && !force && !floor_breached;
     let cats: Vec<String> = if tmp_only {
         vec!["tmp".into()]
     } else {
         Vec::new()
     };
-    let target = target_avail(t);
+    let target = home_target(t);
     for full in [false, true] {
         let plan = plan::scan(&ScanOpts {
             full,
-            level: home_level,
+            level: home_lvl,
             root: None,
             threads: THREADS,
         });
@@ -334,10 +337,10 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
         }
     }
     let now_avail = fs_space(&home()).map(|s| s.1).unwrap_or(0);
-    if level_of(t, now_avail) != Level::Ok {
+    if home_level(t, now_avail) != Level::Ok {
         println!(
             "still {:?} after safe cleanup: a human/agent must review `diskreap scan --full -v` (report-only items)",
-            level_of(t, now_avail)
+            home_level(t, now_avail)
         );
     }
 }

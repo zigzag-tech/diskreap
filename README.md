@@ -69,6 +69,8 @@ diskreap watches `$HOME`'s filesystem and every temp root (`/tmp`, `/var/tmp`, `
 | low | below that | normal horizons |
 | critical | < 5% of the disk, clamped to [3, 30] GiB | shorter horizons (build/worktree 1d, logs 100 MB/6h, caches at 25% of their horizon, unused Docker images) |
 
+**Operator floor.** A host that keeps a large working set (an object store, build caches) can raise the `low` threshold with `min_free_gib`, in `~/.config/diskreap/config.json` (`{"min_free_gib": 120}`, path overridable with `DISKREAP_CONFIG`) or `DISKREAP_MIN_FREE_GIB` (wins over the file). Free space on `$HOME`'s filesystem below it counts as `low` (never `critical`, never a lower level), `auto` acts on it even under `--min-level critical` (the installed hourly timer), and its stop target becomes at least 125% of the floor. A floor above half the filesystem is capped there; a malformed value exits 2. Temp filesystems are not affected.
+
 `auto` stops as soon as free space is back above 20% of the disk, clamped to [15, 150] GiB. It escalates in this order: Docker, logs, temp dirs, build output, caches, worktrees. It only runs the full scan if the quick plan wasn't enough.
 
 ## Install
