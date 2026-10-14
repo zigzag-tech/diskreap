@@ -155,6 +155,28 @@ pub fn min_free_bytes() -> Option<u64> {
     })
 }
 
+/// Parsed operator config file (`$DISKREAP_CONFIG`, default
+/// `~/.config/diskreap/config.json`), or None when absent. Malformed JSON is a loud exit.
+pub fn config_json() -> Option<serde_json::Value> {
+    let path = std::env::var_os("DISKREAP_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config/diskreap/config.json"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(serde_json::from_str(&text).unwrap_or_else(|e| {
+        eprintln!("diskreap: {} is not valid JSON: {e}", path.display());
+        std::process::exit(2)
+    }))
+}
+
+/// `~` / `~/x` -> `$HOME`-based path.
+pub fn expand_tilde(s: &str) -> PathBuf {
+    match s.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None if s == "~" => home(),
+        None => PathBuf::from(s),
+    }
+}
+
 /// Some(Some(bytes)) for a positive number, Some(None) for 0 / empty (unset), None if malformed.
 fn parse_min_free_gib(raw: &str) -> Option<Option<u64>> {
     let t = raw.trim();

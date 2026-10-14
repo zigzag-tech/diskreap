@@ -4,7 +4,7 @@
 //! plus bind-mount sources of running Docker containers (their processes are
 //! usually another uid and invisible in /proc to us).
 
-use crate::util::{run, which};
+use crate::util::{self, run, which};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -211,7 +211,57 @@ impl Refs {
             r.scan_text(&o.stdout, "crontab", home);
         }
         r.path_commands(home);
+        r.operator_protected();
         r
+    }
+
+    /// Operator-declared protection, in the diskreap config file (see README):
+    /// `protect_paths` (globs) and `protect_config_refs` (`[{"file": F, "keys": [K..]}]`:
+    /// every string value stored under key K anywhere in JSON file F is protected). The
+    /// second form keeps a tool's own registry of checkouts (a release system's source
+    /// root) from pointing at a worktree this tool then removes (2026-10-14).
+    fn operator_protected(&mut self) {
+        let Some(cfg) = util::config_json() else { return };
+        let bad = |what: &str| -> ! {
+            eprintln!("diskreap: config {what}");
+            std::process::exit(2)
+        };
+        if let Some(v) = cfg.get("protect_paths") {
+            let Some(arr) = v.as_array() else { bad("protect_paths must be an array of glob strings") };
+            for g in arr {
+                let Some(g) = g.as_str() else { bad("protect_paths must be an array of glob strings") };
+                let pat = util::expand_tilde(g);
+                let Ok(paths) = glob::glob(&pat.to_string_lossy()) else { bad(&format!("protect_paths: bad glob {g:?}")) };
+                // A glob that matches nothing right now still protects its literal prefix.
+                let mut any = false;
+                for m in paths.flatten() {
+                    any = true;
+                    self.refs.push((m, format!("protect_paths {g}")));
+                }
+                if !any {
+                    self.refs.push((pat, format!("protect_paths {g}")));
+                }
+            }
+        }
+        if let Some(v) = cfg.get("protect_config_refs") {
+            let Some(arr) = v.as_array() else { bad("protect_config_refs must be an array of {file, keys}") };
+            for e in arr {
+                let file = e.get("file").and_then(|f| f.as_str());
+                let keys: Option<Vec<&str>> = e
+                    .get("keys")
+                    .and_then(|k| k.as_array())
+                    .map(|a| a.iter().filter_map(|k| k.as_str()).collect());
+                let (Some(file), Some(keys)) = (file, keys) else { bad("protect_config_refs entries need string `file` and array `keys`") };
+                let path = util::expand_tilde(file);
+                let Ok(text) = std::fs::read_to_string(&path) else { continue }; // absent on this host: nothing to protect
+                let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    eprintln!("diskreap: protect_config_refs: {} is not valid JSON; its paths are NOT protected", path.display());
+                    continue;
+                };
+                let src = format!("{} ({})", path.display(), keys.join(","));
+                collect_keyed(&doc, &keys, &src, &mut self.refs);
+            }
+        }
     }
 
     /// Commands on PATH that live inside a tree: uv/pipx tools are symlinks into
@@ -279,6 +329,22 @@ impl Refs {
     }
 }
 
+/// Every string value under any of `keys`, at any depth of `v`.
+fn collect_keyed(v: &serde_json::Value, keys: &[&str], src: &str, out: &mut Vec<(PathBuf, String)>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, val) in m {
+                match val.as_str() {
+                    Some(s) if keys.contains(&k.as_str()) && !s.is_empty() => out.push((util::expand_tilde(s), src.to_string())),
+                    _ => collect_keyed(val, keys, src, out),
+                }
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_keyed(x, keys, src, out)),
+        _ => {}
+    }
+}
+
 fn collect_files(d: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(d) else { return };
     for e in rd.flatten() {
@@ -309,5 +375,45 @@ mod refs_tests {
             "WorkingDirectory=$HOME must not protect everything"
         );
         assert!(r.within(Path::new("/home/u/.cargo")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod protect_tests {
+    use super::*;
+
+    #[test]
+    fn keyed_values_at_any_depth_are_protected_and_other_keys_are_not() {
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"apps":[{"sourceRoot":"/w/a","adapterDirectory":"/w/b"}],"sourceRoot2":"/w/c"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        collect_keyed(&doc, &["sourceRoot"], "cfg", &mut out);
+        let r = Refs { refs: out };
+        assert!(r.within(Path::new("/w/a")).is_some());
+        assert!(r.within(Path::new("/w")).is_some(), "a parent of a protected path is protected too");
+        assert!(r.within(Path::new("/w/b")).is_none());
+        assert!(r.within(Path::new("/w/c")).is_none());
+    }
+
+    #[test]
+    fn config_file_protects_globs_and_referenced_checkouts() {
+        let d = std::env::temp_dir().join(format!("dr-protect-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("wt/keep-1")).unwrap();
+        std::fs::write(d.join("reg.json"), r#"{"apps":[{"sourceRoot":"/reg/src"}]}"#).unwrap();
+        let cfg = format!(
+            r#"{{"protect_paths":["{0}/wt/keep-*"],"protect_config_refs":[{{"file":"{0}/reg.json","keys":["sourceRoot"]}},{{"file":"{0}/absent.json","keys":["x"]}}]}}"#,
+            d.display()
+        );
+        std::fs::write(d.join("config.json"), cfg).unwrap();
+        std::env::set_var("DISKREAP_CONFIG", d.join("config.json"));
+        let mut r = Refs::default();
+        r.operator_protected();
+        std::env::remove_var("DISKREAP_CONFIG");
+        assert!(r.within(&d.join("wt/keep-1")).is_some());
+        assert!(r.within(&d.join("wt/other")).is_none());
+        assert!(r.within(Path::new("/reg/src")).is_some());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
