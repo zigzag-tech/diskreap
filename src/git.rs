@@ -138,6 +138,19 @@ pub fn merged_into(wt: &Path, base: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The first of `base` then the existing `extra` refs that HEAD has landed in: strict
+/// ancestry when `strict`, else ancestry or patch-equivalence.
+pub fn landed_ref(wt: &Path, base: &str, extra: &[String], strict: bool) -> Option<String> {
+    std::iter::once(base)
+        .chain(extra.iter().map(String::as_str))
+        .filter(|r| {
+            r == &base
+                || git(wt, &["rev-parse", "--verify", "-q", r]).map(|o| o.ok).unwrap_or(false)
+        })
+        .find(|r| if strict { is_ancestor(wt, r) } else { merged_into(wt, r) })
+        .map(str::to_string)
+}
+
 /// The main checkout owning a linked worktree, for `git worktree remove`.
 pub fn main_checkout(wt: &Path) -> Option<PathBuf> {
     let common = PathBuf::from(line(
@@ -252,4 +265,42 @@ pub fn ignored_data(wt: &Path, main: &Path) -> Option<String> {
         return Some(rel.to_string());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn sh(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    /// A branch landed on origin/dev only (origin/main untouched) is "landed" iff dev is listed.
+    #[test]
+    fn landed_ref_honours_integration_refs() {
+        let d = std::env::temp_dir().join(format!("dr-landed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        sh(&d, &["init", "-q", "-b", "main"]);
+        sh(&d, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        sh(&d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        sh(&d, &["checkout", "-q", "-b", "task"]);
+        sh(&d, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        sh(&d, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+        let dev = vec!["origin/dev".to_string()];
+        assert_eq!(landed_ref(&d, "origin/main", &[], true), None);
+        assert_eq!(landed_ref(&d, "origin/main", &[], false), None);
+        assert_eq!(landed_ref(&d, "origin/main", &dev, true).as_deref(), Some("origin/dev"));
+        assert_eq!(landed_ref(&d, "origin/main", &["origin/nope".into()], false), None);
+        sh(&d, &["commit", "-q", "--allow-empty", "-m", "unlanded"]);
+        assert_eq!(landed_ref(&d, "origin/main", &dev, false), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -98,6 +98,11 @@ pub struct Policy {
     /// Globs on the worktree's branch name (`protect_worktree_branches`): never removed.
     #[serde(default)]
     pub protect_worktree_branches: Vec<String>,
+    /// Extra `origin/<branch>` refs that also count as "merged" (`worktree_integration_refs`), for
+    /// repos that land on an integration branch (e.g. `origin/dev`) and move the default branch
+    /// only on release. A worktree merged into ANY of them (or the default branch) qualifies.
+    #[serde(default)]
+    pub worktree_integration_refs: Vec<String>,
     pub log_min_bytes: u64,
     pub log_idle_hours: i64,
     /// Percent of each cache's normal age horizon.
@@ -116,6 +121,7 @@ impl Policy {
                 worktree_idle_days: 1,
                 worktree_merged_idle_minutes: None,
                 protect_worktree_branches: vec![],
+                worktree_integration_refs: vec![],
                 log_min_bytes: 100 << 20,
                 log_idle_hours: 6,
                 cache_age_pct: 25,
@@ -129,6 +135,7 @@ impl Policy {
                 worktree_idle_days: 7,
                 worktree_merged_idle_minutes: None,
                 protect_worktree_branches: vec![],
+                worktree_integration_refs: vec![],
                 log_min_bytes: 1 << 30,
                 log_idle_hours: 7 * 24,
                 cache_age_pct: 200,
@@ -141,6 +148,7 @@ impl Policy {
                 worktree_idle_days: 3,
                 worktree_merged_idle_minutes: None,
                 protect_worktree_branches: vec![],
+                worktree_integration_refs: vec![],
                 log_min_bytes: 500 << 20,
                 log_idle_hours: 24,
                 cache_age_pct: 100,
@@ -177,6 +185,16 @@ impl Policy {
                     bad(&format!("protect_worktree_branches: bad glob {g:?}"));
                 }
                 self.protect_worktree_branches.push(g.to_string());
+            }
+        }
+        self.worktree_integration_refs.clear();
+        if let Some(v) = cfg.get("worktree_integration_refs") {
+            let Some(arr) = v.as_array() else { bad("worktree_integration_refs must be an array of origin/<branch> refs") };
+            for r in arr {
+                match r.as_str() {
+                    Some(r) if r.starts_with("origin/") && r.len() > 7 => self.worktree_integration_refs.push(r.to_string()),
+                    _ => bad(&format!("worktree_integration_refs: {r} is not an origin/<branch> ref")),
+                }
             }
         }
         self
@@ -383,11 +401,11 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
                 if !base.starts_with("origin/") {
                     return Err(format!("fast rule needs an origin/ default branch ref; only {base} exists"));
                 }
-                if !git::is_ancestor(p, &base) {
+                if git::landed_ref(p, &base, &cx.policy.worktree_integration_refs, true).is_none() {
                     return Err(format!("HEAD is not an ancestor of {base} (fast rule needs a plain merge)"));
                 }
             }
-            if !git::merged_into(p, &base) {
+            if git::landed_ref(p, &base, &cx.policy.worktree_integration_refs, false).is_none() {
                 return Err(format!("has commits not in {base}"));
             }
             if git::stash_names_branch(p) {
@@ -494,7 +512,8 @@ fn human_window(secs: i64) -> String {
 fn worktree_reason(it: &Item, cx: &Ctx) -> String {
     let p = Path::new(&it.path);
     let last = worktree_last_active(p, it.newest);
-    let base = git::base_ref(p).unwrap_or_default();
+    let base0 = git::base_ref(p).unwrap_or_default();
+    let base = git::landed_ref(p, &base0, &cx.policy.worktree_integration_refs, false).unwrap_or(base0);
     let (window, fast) = worktree_window(p, cx.policy);
     let branch = git::branch(p).map(|b| format!("branch {b} kept, ")).unwrap_or_default();
     format!(
