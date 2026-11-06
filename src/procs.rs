@@ -210,9 +210,46 @@ impl Refs {
         if let Some(o) = run(&["crontab", "-l"], None, Duration::from_secs(10)) {
             r.scan_text(&o.stdout, "crontab", home);
         }
+        r.config_files(home);
         r.path_commands(home);
         r.operator_protected();
+        r.through_links();
         r
+    }
+
+    /// Small text files a service definition names (`Environment=UNITS=/etc/x/units.json`)
+    /// are scanned too, one hop: a broker that starts its engines on demand names their
+    /// interpreters there, not in its unit. Missing that deleted the venv of an idle
+    /// Harmony LLM unit, so every request to it failed (2026-11-06).
+    fn config_files(&mut self, home: &Path) {
+        let named: Vec<(PathBuf, String)> = self.refs.clone();
+        let mut seen = BTreeSet::new();
+        for (p, src) in named {
+            let small = std::fs::metadata(&p).map(|m| m.is_file() && m.len() < 256 << 10).unwrap_or(false);
+            if !small || !seen.insert(p.clone()) {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                self.scan_text(&s, &format!("{} (named by {src})", p.display()), home);
+            }
+        }
+    }
+
+    /// A path reached through a directory symlink protects the symlink's target too
+    /// (`a/.venv -> b/.venv`: deleting b's venv breaks a). Only the parent is resolved;
+    /// a venv's `bin/python -> /usr/bin/python3` must not move the reference out of it.
+    fn through_links(&mut self) {
+        let mut extra = Vec::new();
+        for (p, src) in &self.refs {
+            let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else { continue };
+            if let Ok(real) = std::fs::canonicalize(parent) {
+                let real = real.join(name);
+                if &real != p {
+                    extra.push((real, src.clone()));
+                }
+            }
+        }
+        self.refs.extend(extra);
     }
 
     /// Operator-declared protection, in the diskreap config file (see README):
@@ -375,6 +412,25 @@ mod refs_tests {
             "WorkingDirectory=$HOME must not protect everything"
         );
         assert!(r.within(Path::new("/home/u/.cargo")).is_some());
+    }
+
+    #[test]
+    fn a_named_config_file_and_a_linked_venv_protect_the_real_venv() {
+        let d = std::env::temp_dir().join(format!("dr-linked-venv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let home = d.as_path();
+        let real = home.join("engine/.venv/bin");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("python"), "").unwrap();
+        std::fs::create_dir_all(home.join("fork")).unwrap();
+        std::os::unix::fs::symlink(home.join("engine/.venv"), home.join("fork/.venv")).unwrap();
+        let units = home.join("units.json");
+        std::fs::write(&units, format!("{{\"python\": \"{}/fork/.venv/bin/python\"}}", home.display())).unwrap();
+        let mut r = Refs::from_text(&format!("Environment=UNITS_FILE={}\n", units.display()), Path::new("/nowhere"));
+        r.config_files(Path::new("/nowhere"));
+        r.through_links();
+        assert!(r.within(&home.join("engine/.venv")).is_some());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
 
