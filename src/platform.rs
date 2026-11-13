@@ -69,6 +69,9 @@ mod imp {
     pub fn owned_by_me(m: &Metadata) -> bool {
         m.uid() == unsafe { libc::geteuid() }
     }
+    pub fn uid(m: &Metadata) -> u32 {
+        m.uid()
+    }
     pub fn is_privileged() -> bool {
         unsafe { libc::geteuid() == 0 }
     }
@@ -134,6 +137,9 @@ mod imp {
     }
     pub fn owned_by_me(_: &Metadata) -> bool {
         true // per-user temp dir: everything in it is ours
+    }
+    pub fn uid(_: &Metadata) -> u32 {
+        0
     }
     pub fn is_privileged() -> bool {
         false

@@ -2,7 +2,10 @@
 //! process holds: cwd, executable, open files and mmapped libraries (a running
 //! server may have its node_modules native addons mapped with cwd elsewhere),
 //! plus bind-mount sources of running Docker containers (their processes are
-//! usually another uid and invisible in /proc to us).
+//! usually another uid and invisible in /proc to us), plus every absolute path
+//! on a process's command line (`node --import=/tmp/…/x.mjs` loads a module and
+//! closes it: no fd, no mapping, yet the process needs the file again on restart
+//! or dynamic import).
 
 use crate::util::{self, run, which};
 use std::collections::BTreeSet;
@@ -27,6 +30,7 @@ impl InUse {
             u.proc_linux();
         } else {
             u.lsof();
+            u.ps_args();
         }
         u.docker_mounts();
         u.tmux_panes();
@@ -68,6 +72,51 @@ impl InUse {
             .filter(|p| p.starts_with(dir))
     }
 
+    /// `dir` itself is held (a process's cwd, a pane's path, a mount source, a command-line
+    /// argument), not just something below it. Such a directory is someone's workspace:
+    /// it is never split up and judged entry by entry.
+    pub fn holds(&self, dir: &Path) -> bool {
+        !self.complete || self.set.contains(dir)
+    }
+
+    /// Paths on a command line: arguments that are absolute paths, and the value of
+    /// `--opt=/path`. Our own process and its ancestors are skipped: `diskreap reap X`
+    /// (or the `ssh … sh -c` that runs it) is not a user of X.
+    fn add_args<'a>(&mut self, args: impl Iterator<Item = &'a str>) {
+        for a in args {
+            self.add(a);
+            if let Some((_, v)) = a.split_once('=') {
+                self.add(v);
+            }
+        }
+    }
+
+    /// macOS/BSD: `lsof` has no argv; `ps` does (space-split, so a path with spaces is
+    /// cut short — still a prefix of the real path, i.e. it protects a parent).
+    fn ps_args(&mut self) {
+        let Some(o) = run(&["ps", "-axww", "-o", "pid=,ppid=,args="], None, Duration::from_secs(30)) else {
+            return;
+        };
+        let rows: Vec<(u32, u32, &str)> = o
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let pid = it.next()?.parse().ok()?;
+                let ppid = it.next()?.parse().ok()?;
+                let rest = l.trim_start().splitn(3, char::is_whitespace).nth(2).unwrap_or("");
+                Some((pid, ppid, rest))
+            })
+            .collect();
+        let parents: std::collections::HashMap<u32, u32> = rows.iter().map(|r| (r.0, r.1)).collect();
+        let skip = ancestors(std::process::id(), |p| parents.get(&p).copied());
+        for (pid, _, args) in rows {
+            if !skip.contains(&pid) {
+                self.add_args(args.split_whitespace());
+            }
+        }
+    }
+
     fn sentinel_unknown(&self) -> &PathBuf {
         static UNKNOWN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         UNKNOWN.get_or_init(|| PathBuf::from("<process snapshot unavailable>"))
@@ -85,12 +134,18 @@ impl InUse {
             self.complete = false;
             return;
         };
+        let skip = ancestors(std::process::id(), linux_ppid);
         for e in rd.flatten() {
             let pid = e.file_name();
             if !pid.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
                 continue;
             }
             let base = e.path();
+            let own = pid.to_string_lossy().parse().is_ok_and(|p: u32| skip.contains(&p));
+            if let (false, Ok(cmd)) = (own, std::fs::read(base.join("cmdline"))) {
+                let cmd = String::from_utf8_lossy(&cmd);
+                self.add_args(cmd.split('\0'));
+            }
             for l in ["cwd", "exe"] {
                 if let Ok(t) = std::fs::read_link(base.join(l)) {
                     self.add(&t.to_string_lossy());
@@ -157,9 +212,43 @@ impl InUse {
     }
 }
 
+/// `pid` and every ancestor of it, by a parent lookup.
+fn ancestors(pid: u32, parent: impl Fn(u32) -> Option<u32>) -> BTreeSet<u32> {
+    let mut v = BTreeSet::new();
+    let mut p = pid;
+    while p > 1 && v.insert(p) {
+        match parent(p) {
+            Some(q) => p = q,
+            None => break,
+        }
+    }
+    v
+}
+
+/// PPID from /proc/<pid>/stat (field 4; the command name in field 2 may hold spaces and parens).
+fn linux_ppid(pid: u32) -> Option<u32> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    s[s.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_paths_count_as_in_use_but_not_our_own() {
+        let mut u = InUse::from(&[]);
+        u.add_args(["node", "--import=/tmp/s/x.mjs", "/srv/app/main.js", "rel/path"].into_iter());
+        assert!(u.under(Path::new("/tmp/s")).is_some());
+        assert!(u.under(Path::new("/srv/app")).is_some());
+        assert!(u.holds(Path::new("/srv/app/main.js")));
+        assert!(!u.holds(Path::new("/srv/app")), "a path below is not the dir itself");
+        let me = std::process::id();
+        let skip = ancestors(me, linux_ppid);
+        if cfg!(target_os = "linux") {
+            assert!(skip.contains(&me) && skip.len() >= 2, "self and parent: {skip:?}");
+        }
+    }
 
     #[test]
     fn under_matches_descendants_only() {
@@ -356,6 +445,14 @@ impl Refs {
             .iter()
             .find(|(p, _)| p.starts_with(dir))
             .map(|(_, s)| s.as_str())
+    }
+
+    /// Paths the operator protected with `protect_paths`, with the glob that did it.
+    pub fn protected(&self) -> impl Iterator<Item = (&Path, &str)> {
+        self.refs
+            .iter()
+            .filter(|(_, s)| s.starts_with("protect_paths "))
+            .map(|(p, s)| (p.as_path(), s.as_str()))
     }
 
     #[cfg(test)]

@@ -41,6 +41,20 @@ pub fn ignored_untracked(top: &Path, p: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// Ignored, untracked entries of a checkout, collapsed to the outermost ignored directory.
+pub fn ignored_entries(top: &Path) -> Vec<PathBuf> {
+    git(top, &["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"])
+        .filter(|o| o.ok)
+        .map(|o| {
+            o.stdout
+                .split('\0')
+                .filter(|r| !r.is_empty())
+                .map(|r| top.join(r.trim_end_matches('/')))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn tracked(top: &Path, p: &Path) -> bool {
     let rel = p
         .strip_prefix(top)

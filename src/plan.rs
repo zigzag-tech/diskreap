@@ -5,10 +5,11 @@ use crate::act;
 use crate::git;
 use crate::mounts::{self, Mount};
 use crate::procs::{InUse, Owners, Refs};
-use crate::rules::{Rules, Strat, CACHES, REPORT_ONLY};
+use crate::rules::{is_log, Rules, Strat, CACHES, REPORT_ONLY};
 use crate::util::{self, fs_space, now, which, DAY, GB};
 use crate::walk::{self, Opts};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,16 @@ pub fn home_target(total: u64) -> u64 {
 /// The fast merged-worktree rule never goes below this: a tree touched in the last half hour is live.
 pub const MIN_MERGED_IDLE_MINUTES: i64 = 30;
 
+/// Temp entries are judged at most this deep below their temp root: deep enough for the
+/// entries of a Claude Code session, `/tmp/claude-<uid>/<project>/<session>/<entry>`.
+pub const TMP_MAX_DEPTH: usize = 4;
+/// An unknown `~/.cache/<app>` goes (under pressure) when nothing in it was used for this long.
+pub const UNKNOWN_CACHE_IDLE_DAYS: i64 = 3;
+/// Backups of one series that are never auto-removed.
+pub const BACKUPS_KEPT: usize = 3;
+/// The reason every under-pressure rule gives when the level is ok.
+pub const PRESSURE_ONLY: &str = "only under disk pressure (level low/critical)";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Policy {
     pub build_idle_days: i64,
@@ -111,6 +122,10 @@ pub struct Policy {
     pub tmp_idle_days: i64,
     pub docker_until: String,
     pub docker_unused_images: bool,
+    /// Level low/critical: unknown app caches, old backups and offloaded data may go too.
+    /// Absent in an older plan = false.
+    #[serde(default)]
+    pub pressure_rules: bool,
 }
 
 impl Policy {
@@ -128,6 +143,7 @@ impl Policy {
                 tmp_idle_days: 2,
                 docker_until: "1h".into(),
                 docker_unused_images: true,
+                pressure_rules: true,
             },
             // Daily maintenance while space is fine: only what is clearly stale.
             Level::Ok => Policy {
@@ -142,6 +158,7 @@ impl Policy {
                 tmp_idle_days: 14,
                 docker_until: "168h".into(),
                 docker_unused_images: false,
+                pressure_rules: false,
             },
             Level::Low => Policy {
                 build_idle_days: 3,
@@ -155,6 +172,7 @@ impl Policy {
                 tmp_idle_days: 7,
                 docker_until: "24h".into(),
                 docker_unused_images: false,
+                pressure_rules: true,
             },
         }
     }
@@ -308,11 +326,23 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
     match it.cat.as_str() {
         "tmp" => {
             let md = std::fs::symlink_metadata(p).map_err(|_| "gone")?;
-            if !tmp_roots().iter().any(|r| p.parent() == Some(r.as_path())) {
-                return Err("not directly under a temp dir".into());
+            let (root, depth) = tmp_place(p).ok_or("not inside a temp dir")?;
+            if depth > TMP_MAX_DEPTH {
+                return Err(format!("more than {TMP_MAX_DEPTH} levels below {}", root.display()));
             }
             if !crate::platform::owned_by_me(&md) {
                 return Err("owned by another user".into());
+            }
+            // Below the top level we got here by splitting a kept directory: every directory
+            // in between must still be our own, and nobody's workspace.
+            for a in p.ancestors().skip(1).take(depth - 1) {
+                match std::fs::symlink_metadata(a) {
+                    Ok(m) if m.is_dir() && crate::platform::owned_by_me(&m) => {}
+                    _ => return Err(format!("{} is not our own directory", a.display())),
+                }
+                if cx.inuse.holds(a) {
+                    return Err(format!("inside {}, which a process works in", a.display()));
+                }
             }
             if let Some(h) = cx.inuse.under(p) {
                 return Err(format!("in use ({})", h.display()));
@@ -321,7 +351,12 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
             if st.special {
                 return Err("holds a socket or FIFO (a live session's rendezvous)".into());
             }
-            idle(t, st.newest, cx.tmp_idle_days)
+            if st.keep || keep_marked(p, &root) {
+                return Err("protected by .diskreap-keep".into());
+            }
+            // A split entry's siblings were in use or recently written: an input of that work
+            // (extracted with old mtimes, `cp -a`) that was READ recently is part of it too.
+            idle(t, if depth > 1 { st.used } else { st.newest }, cx.tmp_idle_days)
         }
         "build-output" if under_install_root(p, cx.home).is_some() => Err(format!(
             "inside an installation root ({}): installed software, not build output",
@@ -449,6 +484,9 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
         }
         "cache" => {
             let c = it.cache.as_ref().ok_or("bad plan item")?;
+            if c.strat == "whole" {
+                return unknown_cache(p, c.days, cx);
+            }
             if c.strat == "cmd" {
                 let bin = expand(&c.cmd[0], cx.home);
                 if !(Path::new(&bin).is_file() || which(&bin).is_some()) {
@@ -466,8 +504,246 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
         "docker" => which("docker")
             .map(|_| ())
             .ok_or_else(|| "docker not installed".into()),
+        "backup" => old_backup(p, cx),
+        "offloaded" => offloaded(p, cx),
         _ => Err("report only".into()),
     }
+}
+
+fn pressure(p: &Policy) -> Result<(), String> {
+    if p.pressure_rules {
+        Ok(())
+    } else {
+        Err(PRESSURE_ONLY.into())
+    }
+}
+
+/// A `.diskreap-keep` in `p` or any directory above it, up to and including `stop`.
+/// (The walker honors it for walked categories; these are found without the walker.)
+fn keep_marked(p: &Path, stop: &Path) -> bool {
+    p.ancestors()
+        .take_while(|a| a.starts_with(stop))
+        .any(|a| a.join(".diskreap-keep").is_file())
+}
+
+/// The consumer-side gates every under-pressure rule shares: no process holds or names
+/// anything inside, no service/config/PATH entry references it, no `.diskreap-keep`.
+fn unused(p: &Path, st: &act::TreeStats, cx: &Ctx) -> Result<(), String> {
+    if let Some(h) = cx.inuse.under(p) {
+        return Err(format!("in use ({})", h.display()));
+    }
+    if let Some(src) = cx.refs.within(p) {
+        return Err(format!("referenced by {src}"));
+    }
+    if st.special {
+        return Err("holds a socket or FIFO".into());
+    }
+    if st.keep || keep_marked(p, cx.home) {
+        return Err("protected by .diskreap-keep".into());
+    }
+    Ok(())
+}
+
+/// `~/.cache/<app>` with no row in CACHES. XDG makes `~/.cache` non-essential data, but only
+/// the app knows its invariants (a live content store pins files by name), so it is judged as
+/// ONE unit: the newest use of anything inside, never file by file. Pressure is checked last
+/// so a live one still says why (scan reports it).
+fn unknown_cache(p: &Path, days: i64, cx: &Ctx) -> Result<(), String> {
+    if p.parent() != Some(cx.home.join(".cache").as_path()) {
+        return Err("not a ~/.cache/<app> directory".into());
+    }
+    let md = std::fs::symlink_metadata(p).map_err(|_| "gone")?;
+    if !md.is_dir() {
+        return Err("not a directory".into());
+    }
+    if !mounts::below(cx.mounts, p).is_empty() {
+        return Err("holds a mount".into());
+    }
+    let st = act::tree_stats(p);
+    unused(p, &st, cx)?;
+    idle(now(), st.used, days)?;
+    pressure(cx.policy)
+}
+
+fn is_backup_dir(p: &Path) -> bool {
+    p.file_name()
+        .is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().contains("backup"))
+}
+
+/// A backup's series: its name with each date/time/counter stamp replaced by `#`; None = no
+/// stamp to rotate by. A stamp is a run of digits and `-_.:` (and an ISO `T` between digits)
+/// holding at least 4 digits and touching no letter: `d895982f` is a hash, a name, not a date
+/// (a content-addressed store in a backup dir must never be "rotated"). A short number glued
+/// to a word stays in the name: `db1` and `db2` are two databases, not two dates of one.
+pub fn backup_series(name: &str) -> Option<String> {
+    let c: Vec<char> = name.chars().collect();
+    let in_run = |i: usize| {
+        c[i].is_ascii_digit()
+            || "-_.:".contains(c[i])
+            || (c[i] == 'T' && i > 0 && i + 1 < c.len() && c[i - 1].is_ascii_digit() && c[i + 1].is_ascii_digit())
+    };
+    let (mut out, mut stamped, mut i) = (String::new(), false, 0);
+    while i < c.len() {
+        if !in_run(i) {
+            out.push(c[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < c.len() && in_run(i) {
+            i += 1;
+        }
+        let run: String = c[start..i].iter().collect();
+        let glued = start > 0 && c[start - 1].is_alphanumeric();
+        let lead = if glued { run.chars().take_while(|x| x.is_ascii_digit()).count() } else { 0 };
+        let rest = &run[lead..];
+        let digits = rest.chars().filter(|x| x.is_ascii_digit()).count();
+        let touches_end = i < c.len() && rest.ends_with(|x: char| x.is_ascii_digit());
+        if lead < 4 && digits >= 4 && !touches_end {
+            out.push_str(&run[..lead]);
+            out.push('#');
+            stamped = true;
+        } else {
+            out.push_str(&run);
+        }
+    }
+    stamped.then_some(out)
+}
+
+/// Why a *backup* dir's contents are not ours to rotate, if they are not: a repository's
+/// files are git's business, and an app's own backups (under a dot-dir or an install root
+/// such as `Library/Application Support`) are rotated by the app.
+fn backup_unmanaged(r: &Path, home: &Path) -> Option<String> {
+    if let Some(top) = git::toplevel(r) {
+        return Some(format!("backup dir inside a git repository ({})", top.display()));
+    }
+    let rel = r.strip_prefix(home).ok()?;
+    if rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')) {
+        return Some("an app's own backup dir (under a dot-dir): the app rotates it".into());
+    }
+    under_install_root(r, home).map(|ir| format!("an app's own backup dir (under {ir}): the app rotates it"))
+}
+
+/// A dated backup that is not one of the newest BACKUPS_KEPT of its series (same directory,
+/// same name once stamps are stripped). Only a sibling at least half its size counts as
+/// newer: a broken job writing stubs every night must not push the real backups out.
+fn old_backup(p: &Path, cx: &Ctx) -> Result<(), String> {
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let series = backup_series(&name).ok_or("no date stamp to rotate by")?;
+    let root = p
+        .ancestors()
+        .skip(1)
+        .take(3)
+        .find(|a| is_backup_dir(a))
+        .ok_or("not inside a *backup* directory")?;
+    if let Some(why) = backup_unmanaged(root, cx.home) {
+        return Err(why);
+    }
+    let md = std::fs::symlink_metadata(p).map_err(|_| "gone")?;
+    if md.file_type().is_symlink() {
+        return Err("a symlink".into());
+    }
+    let st = act::tree_stats(p);
+    let parent = p.parent().ok_or("no parent")?;
+    let newer = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path() != p && backup_series(&e.file_name().to_string_lossy()).as_deref() == Some(series.as_str()))
+        .filter(|e| e.file_type().is_ok_and(|t| !t.is_symlink()))
+        .map(|e| (e.path(), act::tree_stats(&e.path())))
+        .filter(|(q, s)| s.bytes >= st.bytes / 2 && (s.newest, q.as_path()) > (st.newest, p))
+        .count();
+    if newer < BACKUPS_KEPT {
+        return Err(format!("one of the newest {BACKUPS_KEPT} full-size backups of series {series}"));
+    }
+    unused(p, &st, cx)?;
+    // A backup written within the day may belong to a run still in progress.
+    idle(now(), st.newest, 1)?;
+    pressure(cx.policy)
+}
+
+/// One line of `offloaded.jsonl`: someone copied `path` off-host to `remote` and verified
+/// the copy at `verified_at`, when the tree held `bytes` (sum of st_size of its
+/// non-directory entries) and its newest mtime was `mtime`.
+#[derive(Deserialize, Clone, Debug)]
+pub struct Offloaded {
+    pub path: String,
+    pub bytes: u64,
+    pub mtime: i64,
+    pub remote: String,
+    pub verified_at: i64,
+}
+
+/// The offload ledger, last record per path winning. Malformed lines are ignored (with a
+/// warning when `warn`): another tool writes this file, and a bad line must not stop a guard.
+pub fn offload_ledger(warn: bool) -> Vec<Offloaded> {
+    let Ok(text) = std::fs::read_to_string(util::state_dir().join("offloaded.jsonl")) else {
+        return Vec::new();
+    };
+    let mut v: Vec<Offloaded> = Vec::new();
+    for (i, l) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        match serde_json::from_str::<Offloaded>(l) {
+            Ok(r) if !r.remote.trim().is_empty() && r.verified_at > 0 => {
+                v.retain(|o| o.path != r.path);
+                v.push(r);
+            }
+            Ok(_) if warn => eprintln!("diskreap: offloaded.jsonl line {}: needs a remote and verified_at; ignored", i + 1),
+            Err(e) if warn => eprintln!("diskreap: offloaded.jsonl line {}: {e}; ignored", i + 1),
+            _ => {}
+        }
+    }
+    v
+}
+
+/// Data the ledger says is safely off-host, still exactly as it was when copied.
+fn offloaded(p: &Path, cx: &Ctx) -> Result<(), String> {
+    let rec = offload_ledger(false)
+        .into_iter()
+        .find(|r| util::expand_tilde(&r.path) == p)
+        .ok_or("no longer in the offload ledger")?;
+    let md = std::fs::symlink_metadata(p).map_err(|_| "gone")?;
+    if md.file_type().is_symlink() {
+        return Err("a symlink".into());
+    }
+    if md.is_dir() && p.join(".git").exists() {
+        return Err("is a git repository/worktree: remove it with git".into());
+    }
+    let st = act::tree_stats(p);
+    if st.apparent != rec.bytes || st.newest != rec.mtime {
+        return Err(format!(
+            "changed since it was offloaded (now {} bytes, mtime {}; ledger {} / {})",
+            st.apparent, st.newest, rec.bytes, rec.mtime
+        ));
+    }
+    unused(p, &st, cx)?;
+    pressure(cx.policy)
+}
+
+/// (temp root, depth below it) for the closest temp root holding `p`.
+fn tmp_place(p: &Path) -> Option<(PathBuf, usize)> {
+    tmp_roots()
+        .into_iter()
+        .filter(|r| p.starts_with(r) && p != r)
+        .map(|r| {
+            let d = p.strip_prefix(&r).map(|x| x.components().count()).unwrap_or(0);
+            (r, d)
+        })
+        .min_by_key(|x| x.1)
+}
+
+/// A kept temp directory is split into its entries when what keeps it is something inside
+/// it (an open file, a named path, a recent write) — not the directory itself being a
+/// process's cwd, and not a socket (a live session's rendezvous keeps the whole entry).
+fn tmp_split(it: &Item, cx: &Ctx) -> bool {
+    let p = Path::new(&it.path);
+    let Some((_, depth)) = tmp_place(p) else { return false };
+    let own_dir = std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && crate::platform::owned_by_me(&m));
+    own_dir
+        && depth < TMP_MAX_DEPTH
+        && (it.why.starts_with("in use") || it.why.starts_with("active"))
+        && !cx.inuse.holds(p)
+        && !act::tree_stats(p).special
 }
 
 /// Newest sign of work in a worktree, cheaply: the walk's newest mtime, git's own
@@ -533,8 +809,13 @@ fn idle(t: i64, last: i64, days: i64) -> Result<(), String> {
 }
 
 /// System and per-user temp dirs (on macOS $TMPDIR is a per-user /var/folders dir).
+/// Test hook: `DISKREAP_TMP_ROOTS` (`:`-separated) replaces them, so the e2e suite never
+/// judges, let alone cleans, the real /tmp of the machine it runs on.
 pub fn tmp_roots() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = vec!["/tmp".into(), "/var/tmp".into(), std::env::temp_dir()];
+    let mut v: Vec<PathBuf> = match std::env::var_os("DISKREAP_TMP_ROOTS") {
+        Some(r) => std::env::split_paths(&r).collect(),
+        None => vec!["/tmp".into(), "/var/tmp".into(), std::env::temp_dir()],
+    };
     v.iter_mut().for_each(|p| *p = crate::platform::canon(p));
     v.sort();
     v.dedup();
@@ -826,6 +1107,46 @@ pub fn scan(o: &ScanOpts) -> Plan {
         items.push(it);
     }
 
+    // Unknown app caches: ~/.cache/<app> with no row in CACHES, one unit each.
+    let known: Vec<&str> = CACHES
+        .iter()
+        .filter_map(|c| c.rel.strip_prefix(".cache/"))
+        .filter_map(|r| r.split('/').next())
+        .collect();
+    for e in std::fs::read_dir(home.join(".cache")).into_iter().flatten().flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if known.contains(&name.as_str())
+            || !e.file_type().is_ok_and(|t| t.is_dir())
+            || !mounts::below(&mounts, &p).is_empty()
+        {
+            continue;
+        }
+        let st = act::tree_stats(&p);
+        if st.bytes < 10 << 20 {
+            continue;
+        }
+        let mut it = item("cache", &p, st.bytes, st.used);
+        it.cache = Some(CacheRef {
+            strat: "whole".into(),
+            depth: 0,
+            days: UNKNOWN_CACHE_IDLE_DAYS,
+            cmd: vec![],
+        });
+        verdict(&mut it, &cx);
+        if it.ok {
+            it.why = format!("unknown app cache, whole dir unused > {UNKNOWN_CACHE_IDLE_DAYS}d (under pressure only)");
+        } else if it.bytes >= GB && it.why != PRESSURE_ONLY {
+            it.cat = "report".into();
+            it.cache = None;
+            it.why = format!(
+                "unknown app cache, {} — not in diskreap's cache table; only the app knows what it can lose",
+                it.why
+            );
+        }
+        items.push(it);
+    }
+
     mark("caches");
     if which("docker").is_some() {
         let mut it = item("docker", Path::new("docker"), 0, 0);
@@ -869,16 +1190,91 @@ pub fn scan(o: &ScanOpts) -> Plan {
         items.push(it);
     }
     mark("docker");
-    let mut tmps: Vec<Item> = Vec::new();
-    for root in tmp_roots() {
-        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
-            let st = act::tree_stats(&e.path());
-            if st.bytes >= 10 << 20 {
-                tmps.push(item("tmp", &e.path(), st.bytes, st.newest));
+    // Temp entries, top level first. One that is kept because of something inside it is
+    // split and its entries judged one by one, down to TMP_MAX_DEPTH: one open file deep in
+    // /tmp/claude-<uid> kept 8.7 GiB of dead sessions (zz-tower2, 2026-11).
+    let roots = tmp_roots();
+    let push_tmp = |v: &mut Vec<Item>, p: PathBuf| {
+        let st = act::tree_stats(&p);
+        if st.bytes >= 10 << 20 && !roots.contains(&p) {
+            v.push(item("tmp", &p, st.bytes, st.newest));
+        }
+    };
+    let mut layer: Vec<Item> = Vec::new();
+    for root in &roots {
+        for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            push_tmp(&mut layer, e.path());
+        }
+    }
+    while !layer.is_empty() {
+        let mut judged = verdicts(layer, &cx);
+        let mut next = Vec::new();
+        for it in judged.iter_mut().filter(|i| !i.ok) {
+            if tmp_split(it, &cx) {
+                it.why += "; its entries are judged one by one";
+                for e in std::fs::read_dir(&it.path).into_iter().flatten().flatten() {
+                    push_tmp(&mut next, e.path());
+                }
+            }
+        }
+        items.extend(judged);
+        layer = next;
+    }
+
+    // Backups: dated entries of a *backup* dir (and of its undated subdirectories, two
+    // levels), grouped into series. All but the newest BACKUPS_KEPT of a series may go
+    // under pressure; the newest, the undated, and backup dirs we do not rotate are reported.
+    let backup_roots: Vec<&walk::Found> = w
+        .found
+        .iter()
+        .filter(|f| f.kind == "backup")
+        .filter(|f| !w.found.iter().any(|o| o.kind == "backup" && o.path != f.path && f.path.starts_with(&o.path)))
+        .filter(|f| !ok_worktrees.iter().any(|wt| f.path.starts_with(wt)))
+        .collect();
+    let mut old_backups: Vec<Item> = Vec::new();
+    for f in backup_roots {
+        match backup_unmanaged(&f.path, &home) {
+            Some(why) => {
+                let mut it = item("report", &f.path, f.bytes, f.newest);
+                it.why = why;
+                items.push(it);
+            }
+            None if backup_series_in(&f.path, 0, &mut old_backups, &mut items) => {}
+            None => {
+                let mut it = item("report", &f.path, f.bytes, f.newest);
+                it.why = "backup dir with no dated backups to rotate — a human decides".into();
+                items.push(it);
             }
         }
     }
-    items.extend(verdicts(tmps, &cx));
+    for mut it in verdicts(old_backups, &cx) {
+        if !it.ok && it.why != PRESSURE_ONLY {
+            it.cat = "report".into();
+            it.why = format!("backup kept: {} — a human decides", it.why);
+        } else if it.ok {
+            it.why = format!("older than the newest {BACKUPS_KEPT} of its series, unused (under pressure only)");
+        }
+        items.push(it);
+    }
+
+    // Offloaded: the ledger's paths, still exactly as they were copied.
+    for r in offload_ledger(true) {
+        let p = util::expand_tilde(&r.path);
+        if std::fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        let st = act::tree_stats(&p);
+        let mut it = item("offloaded", &p, st.bytes, st.newest);
+        verdict(&mut it, &cx);
+        if it.ok {
+            it.why = format!(
+                "copied to {}, verified {} ago; size and mtime unchanged (under pressure only)",
+                r.remote,
+                util::ago(r.verified_at)
+            );
+        }
+        items.push(it);
+    }
 
     for (rel, why) in REPORT_ONLY {
         let p = home.join(rel);
@@ -914,6 +1310,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
                 items.push(it);
             }
         }
+        full_reports(&w, &refs, &home, &mounts, &ok_worktrees, &mut items);
     }
 
     // Keep plans small: tiny skips are noise.
@@ -945,6 +1342,116 @@ pub fn scan(o: &ScanOpts) -> Plan {
         stalled: s(&w.stalled),
         skipped_mounts: s(&w.skipped_mounts),
         kept: s(&w.kept),
+    }
+}
+
+/// One directory of a backup root: dated entries become series, undated subdirectories are
+/// descended (per-host / per-database folders), other undated entries are reported. Returns
+/// false when nothing at or below `d` is dated: the caller then reports `d` as ONE item.
+fn backup_series_in(d: &Path, depth: usize, old: &mut Vec<Item>, items: &mut Vec<Item>) -> bool {
+    let mut series: BTreeMap<String, Vec<(PathBuf, act::TreeStats)>> = BTreeMap::new();
+    let (mut undated, mut dated_below) = (Vec::new(), false);
+    for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+        let p = e.path();
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        match backup_series(&e.file_name().to_string_lossy()) {
+            Some(s) => series.entry(s).or_default().push((p.clone(), act::tree_stats(&p))),
+            None if ft.is_dir() && depth < 2 && backup_series_in(&p, depth + 1, old, items) => dated_below = true,
+            None => undated.push(p),
+        }
+    }
+    if series.is_empty() && !dated_below {
+        return false;
+    }
+    for p in undated {
+        let st = act::tree_stats(&p);
+        let mut it = item("report", &p, st.bytes, st.newest);
+        it.why = "backup without a date stamp to rotate by — a human decides".into();
+        items.push(it);
+    }
+    for (s, mut v) in series {
+        v.sort_by(|a, b| (b.1.newest, &b.0).cmp(&(a.1.newest, &a.0)));
+        let n = v.len();
+        for (i, (p, st)) in v.into_iter().enumerate() {
+            let mut it = item(if i < BACKUPS_KEPT { "report" } else { "backup" }, &p, st.bytes, st.newest);
+            if i < BACKUPS_KEPT {
+                it.why = format!("one of the newest {BACKUPS_KEPT} backups of series {s} ({n} in all) — a human decides");
+                items.push(it);
+            } else {
+                old.push(it);
+            }
+        }
+    }
+    true
+}
+
+/// Full scan only: what no rule may remove but a human should see — protected paths,
+/// git-ignored data in checkouts (a dataset, run logs), and directories another user owns.
+/// Each ≥ 1 GiB, once (not inside something already reported).
+fn full_reports(w: &walk::WalkResult, refs: &Refs, home: &Path, mounts: &[Mount], ok_worktrees: &[PathBuf], items: &mut Vec<Item>) {
+    let covered = |items: &[Item], p: &Path| items.iter().any(|i| i.cat == "report" && p.starts_with(&i.path));
+    let mut prot: Vec<(&Path, &str)> = refs.protected().filter(|(p, _)| p.starts_with(home) && p.exists()).collect();
+    prot.sort();
+    let mut seen: Vec<&Path> = Vec::new();
+    for (p, src) in prot {
+        if seen.iter().any(|s| p.starts_with(s)) {
+            continue;
+        }
+        seen.push(p);
+        let (b, newest) = act::du_stats(p, mounts);
+        if b >= GB {
+            items.retain(|i| !(i.cat == "report" && Path::new(&i.path) == p)); // "protected" says more than "cold"
+            let mut it = item("report", p, b, newest);
+            it.why = format!("protected ({src}) — never cleaned; a human decides");
+            items.push(it);
+        }
+    }
+    for f in w.found.iter().filter(|f| f.kind == "other-owner" && f.bytes >= GB) {
+        if covered(items, &f.path) {
+            continue;
+        }
+        let uid = std::fs::symlink_metadata(&f.path).map(|m| crate::platform::uid(&m)).unwrap_or(0);
+        let mut it = item("report", &f.path, f.bytes, f.newest);
+        it.why = format!(
+            "owned by {}: diskreap cannot remove it; someone with the rights decides",
+            if uid == 0 { "root".to_string() } else { format!("uid {uid}") }
+        );
+        items.push(it);
+    }
+    let tops = w.found.iter().filter(|f| {
+        (f.kind == "repo" || f.kind == "worktree")
+            && f.bytes >= GB
+            && !ok_worktrees.contains(&f.path)
+            && under_install_root(&f.path, home).is_none() // ~/.nvm's node versions are installed software
+    });
+    for top in tops {
+        for p in git::ignored_entries(&top.path) {
+            // Already judged elsewhere: inside a candidate or report, or holding another checkout.
+            let judged = w.found.iter().any(|f| {
+                f.path != top.path
+                    && match f.kind {
+                        "repo" | "worktree" => f.path.starts_with(&p),
+                        _ => p.starts_with(&f.path),
+                    }
+            });
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if judged || covered(items, &p) || is_log(&name) {
+                continue;
+            }
+            let (b, newest) = act::du_stats(&p, mounts);
+            if b >= GB {
+                let mut it = item("report", &p, b, newest);
+                it.why = format!(
+                    "git-ignored data in {}, modified {} ago — not build output; a human decides",
+                    top.path.display(),
+                    util::ago(newest)
+                );
+                items.push(it);
+            }
+        }
     }
 }
 
@@ -1036,6 +1543,35 @@ mod tests {
         assert_eq!(level_with_floor(t, 50 * GB, Some(500 * GB)), Level::Low);
         // A floor larger than half the disk is capped: a 100 GiB disk with 60 free stays Ok.
         assert_eq!(level_with_floor(100 * GB, 60 * GB, Some(500 * GB)), Level::Ok);
+    }
+
+    #[test]
+    fn backup_series_strip_dates_not_ids() {
+        assert_eq!(backup_series("unchain-20261104-043001.dump").as_deref(), Some("unchain#dump"));
+        assert_eq!(backup_series("unchain-20261108-043001.dump"), backup_series("unchain-20261104-043001.dump"));
+        assert_eq!(backup_series("2026-11-04").as_deref(), Some("#"));
+        assert_eq!(backup_series("site_1699999999.tar.gz").as_deref(), Some("site#tar.gz"));
+        assert_eq!(backup_series("db1.dump"), None, "a short number names a thing, not a date");
+        assert_ne!(backup_series("db1-20261104.dump"), backup_series("db2-20261104.dump"));
+        assert_eq!(backup_series("latest.dump"), None);
+        assert_eq!(backup_series("d895982f4f09ac4f"), None, "a hex hash is a name");
+        assert_eq!(backup_series("12345678abcdef"), None);
+        assert_eq!(backup_series("db-2026-11-04T10-00.tar.gz").as_deref(), Some("db#tar.gz"));
+        assert_eq!(backup_series("db-2026-11-04T10-00Z.tar"), None, "touches a letter: not sure, keep");
+    }
+
+    #[test]
+    fn under_pressure_rules_only_at_low_or_critical() {
+        assert!(!Policy::for_level(Level::Ok).pressure_rules);
+        assert!(Policy::for_level(Level::Low).pressure_rules);
+        assert!(Policy::for_level(Level::Critical).pressure_rules);
+        let old: Policy = serde_json::from_value({
+            let mut v = serde_json::to_value(Policy::for_level(Level::Critical)).unwrap();
+            v.as_object_mut().unwrap().remove("pressure_rules");
+            v
+        })
+        .unwrap();
+        assert!(!old.pressure_rules, "a plan from before 0.3 never unlocks them");
     }
 
     #[test]
