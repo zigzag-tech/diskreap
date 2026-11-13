@@ -61,6 +61,46 @@ fn refused(reason: impl Into<String>) -> Outcome {
     Outcome { state: "refused", reason: reason.into(), freed: 0, archive_ref: String::new() }
 }
 
+/// A git repository or worktree anywhere in `p` (4 levels, 20 000 entries;
+/// symlinks not followed). `reap` only refuses a checkout at the top level, so a
+/// directory that merely holds worktrees would otherwise take their uncommitted
+/// work with it (zz-tower0 dry run, 2026-11-13: ~/worktrees/lodestar-platform).
+/// Exhausting the budget counts as "might contain one": refuse.
+pub fn git_checkout_within(p: &Path) -> Option<PathBuf> {
+    let mut stack = vec![(p.to_path_buf(), 0)];
+    let mut seen = 0u32;
+    while let Some((dir, depth)) = stack.pop() {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > 20_000 {
+                return Some(p.to_path_buf());
+            }
+            if depth < 4 && e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push((e.path(), depth + 1));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_tree_holding_a_worktree_is_found() {
+        let t = std::env::temp_dir().join(format!("dr-gitfloor-{}", std::process::id()));
+        let wt = t.join("proj/feature-x");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(super::git_checkout_within(&t).is_none());
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere").unwrap();
+        assert_eq!(super::git_checkout_within(&t).unwrap(), wt);
+        let _ = std::fs::remove_dir_all(&t);
+    }
+}
+
 /// What one execute shares across its items: snapshots are taken once.
 pub struct Ctx<'a> {
     pub plan: Option<&'a crate::plan::Plan>,
@@ -83,6 +123,13 @@ fn floor(c: &Cand, action: &str, cx: &Ctx) -> Result<(), String> {
     }
     if c.tier == "protected" {
         return Err("protected".into());
+    }
+    // Plan items keep their category's own checks (a merged worktree IS a checkout);
+    // report-only deletes go through `reap`, which only looks at the top level.
+    if action == "delete" && !c.plan_ok {
+        if let Some(repo) = git_checkout_within(p) {
+            return Err(format!("contains a git checkout ({}): remove it with git after checking its work", repo.display()));
+        }
     }
     if action == "delete" && c.personal {
         return Err("personal data is archived, never deleted outright".into());
