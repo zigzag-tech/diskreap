@@ -83,11 +83,11 @@ ends with a `run-summary` line holding the measured df gain).
 
 ## Automatic mode
 
-`diskreap auto --min-level critical` is installed as an hourly guard (systemd user
+`diskreap auto --min-level low` is installed as an hourly guard (systemd user
 timer / launchd / cron); routine maintenance is a daily `diskreap auto --min-level ok`
-or an orchestrator calling `scan`/`clean --json`. `auto` does nothing below its level. When free space drops below 15% or 30 GiB
-(**low**) it runs a quick scan + clean, escalating to a full scan, and stops once
-free space is back above max(20%, 40 GiB). Below 5% or 10 GiB (**critical**) the
+or an orchestrator calling `scan`/`clean --json`. `auto` does nothing below its level. When free space drops below
+min(15% of the disk, 100 GiB) (**low**; or below the host's `min_free_gib`) it runs a quick scan + clean,
+escalating to a full scan, and stops once 15% is free again (no cap: a 1.8 TiB disk climbs back to 270 GiB). Below 5% or 10 GiB (**critical**) the
 age horizons shorten. If `$HOME` is still critical afterwards it exits 3 and writes
 `~/.local/state/diskreap/needs-supervision.json` (`status --json` → `needs_supervision`). Check its log with `journalctl --user -u diskreap` (Linux)
 or `~/.local/state/diskreap/auto.log` (macOS).

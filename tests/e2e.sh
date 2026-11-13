@@ -263,10 +263,17 @@ PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=1 "$B" auto --min-level critical >/dev
 rc=0; PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=$((1 << 62)) "$B" auto --min-level critical >/dev/null 2>&1 || rc=$?
 [ "$rc" = 0 ] && [ ! -e "$M" ] && echo "ok    fine again: marker cleared, exit 0" || { echo "FAIL  marker not cleared rc=$rc"; fail=1; }
 [ "$("$B" status --json | jq -c .needs_supervision)" = null ] && echo "ok    status --json needs_supervision null" || { echo "FAIL  status not null"; fail=1; }
-# Keep-above (0.4): at 15% free a big or small disk is low, the hourly guard (--min-level low)
-# acts, escalates to a full scan once, and skips the full scan on the next run within 6 h.
-tot=$("$B" status --json | jq .total_bytes); low=$((tot * 15 / 100))
-[ "$(DISKREAP_TEST_AVAIL_BYTES=$low "$B" status --json 2>/dev/null | jq -r .home_level)" = low ] && echo "ok    15% free is low" || { echo "FAIL  15% not low"; fail=1; }
+# Keep-above (0.6): just under the trigger, min(15%, 100 GiB), a big or small disk is low, the
+# hourly guard (--min-level low) acts, escalates to a full scan once, and skips the full scan on
+# the next run within 6 h. Just above it the disk is ok, while the stop target stays 15%.
+tot=$("$B" status --json | jq .total_bytes); thr=$("$B" status --json | jq .low_avail_bytes)
+want=$((tot * 15 / 100)); [ "$want" -gt $((100 << 30)) ] && want=$((100 << 30))
+lo=$((tot * 30 / 100)); [ "$lo" -gt $((10 << 30)) ] && lo=$((10 << 30)); [ "$want" -lt "$lo" ] && want=$lo  # small-disk floor
+[ "$thr" = "$want" ] && echo "ok    trigger is min(15%, 100 GiB)" || { echo "FAIL  trigger $thr != $want"; fail=1; }
+[ "$("$B" status --json | jq .target_avail_bytes)" -ge $((tot * 15 / 100)) ] && echo "ok    target is at least 15%, uncapped" || { echo "FAIL  target capped"; fail=1; }
+[ "$(DISKREAP_TEST_AVAIL_BYTES=$((thr + (1 << 20))) "$B" status --json 2>/dev/null | jq -r .home_level)" = ok ] && echo "ok    just above the trigger is ok" || { echo "FAIL  above trigger not ok"; fail=1; }
+low=$((thr - (1 << 20)))
+[ "$(DISKREAP_TEST_AVAIL_BYTES=$low "$B" status --json 2>/dev/null | jq -r .home_level)" = low ] && echo "ok    just below the trigger is low" || { echo "FAIL  below trigger not low"; fail=1; }
 rm -f "$T/state/auto-full.stamp"
 o1=$(PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=$low "$B" auto --min-level low 2>&1 || true)
 grep -q '^full scan:' <<<"$o1" && echo "ok    low: auto acts and escalates to a full scan" || { echo "FAIL  low auto did not act: $o1"; fail=1; }

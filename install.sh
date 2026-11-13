@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # install.sh — build diskreap, schedule `diskreap auto` hourly, link the agent skill.
 #
-#   ./install.sh                 # binary + timer + skill links
+#   ./install.sh                 # binary + hourly guard (auto --min-level low: acts below
+#                                # min(15%, 100 GiB) free, restores 15%) + skill links
 #   ./install.sh --claude-hook   # also add a Claude Code SessionStart hook that
 #                                # warns agents when the disk is low
 #   ./install.sh --no-timer      # binary + skill only

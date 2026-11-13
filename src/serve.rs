@@ -204,7 +204,7 @@ impl Svc {
             "state": "present", "machine": self.machine, "version": env!("CARGO_PKG_VERSION"),
             "avail_bytes": avail, "total_bytes": total, "level": level,
             "used_pct": if total > 0 { ((total - avail.min(total)) as f64 * 1000.0 / total as f64).round() / 10.0 } else { 0.0 },
-            "target_free_pct": plan::KEEP_FREE_PCT,
+            "target_free_pct": plan::KEEP_FREE_PCT, "low_cap_bytes": plan::LOW_CAP,
             "needs_supervision": crate::util::state_dir().join("needs-supervision.json").exists(),
             "archive": if archive.is_some() { "configured" } else { "unconfigured" },
             "serving_since_ms": self.since_ms,

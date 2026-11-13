@@ -23,34 +23,43 @@ pub enum Level {
     Critical,
 }
 
-/// Keep-above policy (0.4): a disk is `low` whenever less than 20% is free, and `auto`
-/// works until 20% is free again. Thresholds are a share of the filesystem; only their
-/// lower bound is absolute, capped at a share of the filesystem, or a 15 GB tmpfs would
-/// read "low" at 56% free. There is no upper clamp on `low` or the target any more: with
-/// `low` capped at 100 GiB a 1.8 TiB disk sat at 3% free for weeks without `auto` acting
-/// (zz-tower0, 2026-11). `critical` keeps its 30 GiB cap: it is the emergency band
-/// (shortest horizons, the needs-supervision marker), not the trigger to act.
+/// Keep-above policy (0.6): a disk is `low` when less than min(15%, 100 GiB) is free, and
+/// once `auto` acts it works until 15% is free again. Thresholds are a share of the
+/// filesystem; their lower bound is absolute, capped at a share of the filesystem, or a
+/// 15 GB tmpfs would read "low" at 56% free. Only the trigger is capped (the operator's
+/// rule, 2026-11-14: a big disk with 100 GiB free is not under pressure). The stop target
+/// is not: with both capped at 100 GiB a 1.8 TiB disk sat at 3% free for weeks without
+/// `auto` doing useful recovery (zz-tower0, 2026-11), so once triggered it climbs back to
+/// 15%. `critical` keeps its 30 GiB cap: it is the emergency band (shortest horizons, the
+/// needs-supervision marker), not the trigger to act.
 fn clamp_share(total: u64, pct: u64, floor: u64, floor_cap_pct: u64, hi: u64) -> u64 {
     let lo = floor.min(total * floor_cap_pct / 100);
     (total * pct / 100).clamp(lo, hi.max(lo))
 }
 
-/// Free-space share `auto` keeps above, and below which a disk is `low`.
-pub const KEEP_FREE_PCT: u64 = 20;
+/// Free-space share `auto` restores, and below which a disk is `low` (up to LOW_CAP).
+pub const KEEP_FREE_PCT: u64 = 15;
+/// `low` never needs more free than this, however big the disk; the stop target has no cap.
+pub const LOW_CAP: u64 = 100 * GB;
 
-/// Low: free < 20%, at least min(10 GiB, 30%).
+/// Free space below which a disk is `low`: min(15%, 100 GiB), at least min(10 GiB, 30%).
+pub fn low_avail(total: u64) -> u64 {
+    clamp_share(total, KEEP_FREE_PCT, 10 * GB, 30, LOW_CAP)
+}
+
+/// Low: free < low_avail.
 /// Critical: free < 5%, at least min(3 GiB, 10%), at most 30 GiB.
 pub fn level_of(total: u64, avail: u64) -> Level {
     if avail < clamp_share(total, 5, 3 * GB, 10, 30 * GB) {
         Level::Critical
-    } else if avail < clamp_share(total, KEEP_FREE_PCT, 10 * GB, 30, u64::MAX) {
+    } else if avail < low_avail(total) {
         Level::Low
     } else {
         Level::Ok
     }
 }
 
-/// `auto` stops once free space is back above this: 20%, at least min(15 GiB, 40%).
+/// `auto` stops once free space is back above this: 15%, at least min(15 GiB, 40%), no cap.
 pub fn target_avail(total: u64) -> u64 {
     clamp_share(total, KEEP_FREE_PCT, 15 * GB, 40, u64::MAX)
 }
@@ -82,6 +91,12 @@ pub fn target_with_floor(total: u64, floor: Option<u64>) -> u64 {
 
 pub fn home_level(total: u64, avail: u64) -> Level {
     level_with_floor(total, avail, util::min_free_bytes())
+}
+
+/// Free space on `$HOME`'s filesystem below which it is `low`, operator floor included.
+pub fn home_low(total: u64) -> u64 {
+    let l = low_avail(total);
+    effective_floor(total, util::min_free_bytes()).map_or(l, |f| l.max(f))
 }
 
 pub fn home_target(total: u64) -> u64 {
@@ -1515,18 +1530,27 @@ mod tests {
 
     #[test]
     fn levels() {
-        let t = 1800 * GB; // big disk: low below 20% = 360 GiB, no cap (zz-tower0 sat at 3%)
-        assert_eq!(level_of(t, 370 * GB), Level::Ok);
-        assert_eq!(level_of(t, 350 * GB), Level::Low);
+        let t = 1800 * GB; // big disk: low below min(15%, 100 GiB) = 100 GiB
+        assert_eq!(level_of(t, 110 * GB), Level::Ok);
+        assert_eq!(level_of(t, 99 * GB), Level::Low);
         assert_eq!(level_of(t, 55 * GB), Level::Low);
         assert_eq!(level_of(t, 29 * GB), Level::Critical);
-        assert_eq!(target_avail(t), 360 * GB);
+        // ...but once triggered, auto climbs back to 15% = 270 GiB: the target has no cap
+        // (zz-tower0 sat at 3% free for weeks with a capped target).
+        assert_eq!(target_avail(t), 270 * GB);
+        assert_eq!(low_avail(t), 100 * GB);
+        // The cap takes over just above 666 GiB: 15% of 700 GiB is 105 GiB, capped to 100.
+        assert_eq!(level_of(700 * GB, 99 * GB), Level::Low);
+        assert_eq!(level_of(700 * GB, 101 * GB), Level::Ok);
+        assert_eq!(target_avail(700 * GB), 105 * GB);
+        assert_eq!(level_of(400 * GB, 59 * GB), Level::Low); // 15% = 60 GiB
+        assert_eq!(level_of(400 * GB, 61 * GB), Level::Ok);
+        assert_eq!(target_avail(400 * GB), 60 * GB);
         let small = 30 * GB; // small VM: 50% free is fine
         assert_eq!(level_of(small, 15 * GB), Level::Ok);
         assert_eq!(level_of(small, 8 * GB), Level::Low); // floor = min(10 GiB, 30%) = 9 GiB
         assert_eq!(level_of(small, 2 * GB), Level::Critical);
-        assert_eq!(level_of(400 * GB, 79 * GB), Level::Low); // 20% = 80 GiB
-        assert_eq!(level_of(400 * GB, 81 * GB), Level::Ok);
+        assert_eq!(target_avail(small), 12 * GB); // min(15 GiB, 40%)
         let tmpfs = 15 * GB + GB / 2; // half-empty small tmpfs is fine; nearly full is not
         assert_eq!(level_of(tmpfs, 8 * GB), Level::Ok);
         assert_eq!(level_of(tmpfs, 3 * GB), Level::Low);
@@ -1536,14 +1560,20 @@ mod tests {
     #[test]
     fn operator_floor() {
         let t = 1800 * GB;
-        // Default: 370 GiB free is Ok on a big disk (low is below 20% = 360 GiB).
-        assert_eq!(level_with_floor(t, 370 * GB, None), Level::Ok);
-        // Floor 400 GiB: the same disk is Low, and target rises to 500 GiB (floor + 25%).
+        // Default: 110 GiB free is Ok on a big disk (low is below 100 GiB).
+        assert_eq!(level_with_floor(t, 110 * GB, None), Level::Ok);
+        // Floor 120 GiB (xc-tower-ubuntu): the same disk is Low; the target stays 15% = 270
+        // GiB because 125% of the floor (150 GiB) is below it.
+        assert_eq!(level_with_floor(t, 110 * GB, Some(120 * GB)), Level::Low);
+        assert_eq!(target_with_floor(t, Some(120 * GB)), 270 * GB);
+        // A floor below the built-in trigger (40 GiB, zz-tower2) changes nothing on a big disk.
+        assert_eq!(level_with_floor(t, 90 * GB, Some(40 * GB)), Level::Low);
+        assert_eq!(level_with_floor(t, 110 * GB, Some(40 * GB)), Level::Ok);
+        assert_eq!(target_with_floor(t, Some(40 * GB)), 270 * GB);
+        // Floor 400 GiB: Low below it, and target rises to 500 GiB (floor + 25%).
         assert_eq!(level_with_floor(t, 370 * GB, Some(400 * GB)), Level::Low);
         assert_eq!(level_with_floor(t, 410 * GB, Some(400 * GB)), Level::Ok);
         assert_eq!(target_with_floor(t, Some(400 * GB)), 500 * GB);
-        // A floor below 20% never lowers the target.
-        assert_eq!(target_with_floor(t, Some(120 * GB)), 360 * GB);
         // Never lowers a level, never makes Critical.
         assert_eq!(level_with_floor(t, 29 * GB, Some(10 * GB)), Level::Critical);
         assert_eq!(level_with_floor(t, 50 * GB, Some(10 * GB)), Level::Low);
