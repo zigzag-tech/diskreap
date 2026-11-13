@@ -84,7 +84,7 @@ diskreap watches `$HOME`'s filesystem and every temp root (`/tmp`, `/var/tmp`, `
 
 | Level | Free space | Effect |
 |---|---|---|
-| ok | ≥ 20% of the disk (at least min(10 GiB, 30%); no upper cap) | daily maintenance only: clearly stale items (build output idle 14d, worktrees 7d, caches at 2× horizon, logs ≥ 1 GB idle 7d, Docker cache older than 7d) |
+| ok | ≥ min(15% of the disk, 100 GiB) (at least min(10 GiB, 30%)) | daily maintenance only: clearly stale items (build output idle 14d, worktrees 7d, caches at 2× horizon, logs ≥ 1 GB idle 7d, Docker cache older than 7d) |
 | low | below that | normal horizons |
 | critical | < 5% of the disk, clamped to [3, 30] GiB | shorter horizons (build/worktree 1d, logs 100 MB/6h, caches at 25% of their horizon, unused Docker images) |
 
@@ -98,13 +98,13 @@ diskreap watches `$HOME`'s filesystem and every temp root (`/tmp`, `/var/tmp`, `
 
 **Worktrees that hold work are reported, never deleted.** `diskreap scan` ends with `WORKTREES NEEDING A HUMAN`: every dirty or unmerged worktree, biggest first, with size, kind, time since last activity, branch, what is wrong, a best-effort owner (a process or tmux pane with that cwd, or the `git worktree lock` reason) and the path, plus a count and total size. `status` repeats the count from the last scan. `clean` (dry run or not) prints why each worktree is removed (`clean, merged into origin/main, idle 3h (needs 2h, worktree_merged_idle_minutes); branch X kept, no process inside`).
 
-**Keep above 20%.** The installed hourly guard runs `auto --min-level low`: it acts whenever less than 20% of the disk is free (or less than `min_free_gib`) and keeps going until 20% is free again (at least min(15 GiB, 40%); no upper cap, so a 1.8 TiB disk aims for 360 GiB). It escalates in this order: Docker, logs, temp dirs, build output, caches, offloaded data, worktrees, old backups. It runs the full scan only if the quick plan wasn't enough, and at most every 6 h unless the disk is critical (a disk that safe cleanup cannot bring back would otherwise be walked every hour). What is left is report-only: a person or a supervised run decides about it.
+**Act below min(15%, 100 GiB), restore 15%.** The installed hourly guard runs `auto --min-level low`: it acts whenever less than min(15% of the disk, 100 GiB) is free (or less than `min_free_gib`): 15% on disks up to ~667 GiB, 100 GiB above that. Once it acts it keeps going until 15% is free again (at least min(15 GiB, 40%); the target has no cap, so a 1.8 TiB disk that drops under 100 GiB climbs back to 270 GiB — a capped target left zz-tower0 at 3% free for weeks). `status` prints both numbers; `status --json` has `low_avail_bytes` and `target_avail_bytes`. It escalates in this order: Docker, logs, temp dirs, build output, caches, offloaded data, worktrees, old backups. It runs the full scan only if the quick plan wasn't enough, and at most every 6 h unless the disk is critical (a disk that safe cleanup cannot bring back would otherwise be walked every hour). What is left is report-only: a person or a supervised run decides about it.
 
 ## Install
 
 ```bash
 git clone https://github.com/zigzag-tech/diskreap && cd diskreap
-./install.sh                 # binary + hourly keep-above-20% guard (systemd user / launchd / cron) + agent skill links
+./install.sh                 # binary + hourly keep-above guard (acts below min(15%, 100 GiB)) (systemd user / launchd / cron) + agent skill links
 ./install.sh --claude-hook   # also warn Claude Code sessions when the disk is low
 ```
 

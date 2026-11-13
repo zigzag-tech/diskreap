@@ -231,6 +231,7 @@ fn status(hook: bool, json: bool) {
             serde_json::json!({
                 "host": util::hostname(), "home": home(), "total_bytes": t, "avail_bytes": a,
                 "level": worst, "home_level": home_level(t, a), "target_avail_bytes": home_target(t),
+                "low_avail_bytes": plan::home_low(t),
                 "filesystems": fss, "version": env!("CARGO_PKG_VERSION"),
                 "needs_supervision": read_marker(),
             })
@@ -270,7 +271,11 @@ fn status(hook: bool, json: bool) {
             f.level
         );
     }
-    println!("auto target for $HOME: {}", human(home_target(t)));
+    println!(
+        "auto for $HOME: acts below {} free, then restores {}",
+        human(plan::home_low(t)),
+        human(home_target(t))
+    );
     if let Some(p) = Plan::load() {
         println!(
             "last plan: {} scan {} ago, {} reclaimable",
@@ -325,7 +330,7 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
     };
     let target = home_target(t);
     for full in [false, true] {
-        // Keep-above makes `auto` act on every hourly run while a disk stays under 20%; a
+        // Keep-above makes `auto` act on every hourly run while a disk stays low; a
         // big disk that safe cleanup cannot bring back would otherwise get a full walk every
         // hour. Escalate to the full scan at most every FULL_AUTO_EVERY, unless critical.
         if full && home_lvl != Level::Critical && !dry_run && !force && full_auto_recent() {
