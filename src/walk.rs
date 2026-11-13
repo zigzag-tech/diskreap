@@ -95,6 +95,8 @@ struct Item {
     accs: Vec<Arc<Acc>>,
     detect: bool,
     sizing: bool,
+    /// Inside a directory owned by another user (already recorded as "other-owner").
+    foreign: bool,
 }
 
 #[derive(Default)]
@@ -151,6 +153,7 @@ pub fn walk(opts: Opts, cls: Box<dyn Classify>) -> WalkResult {
                 accs: vec![root_acc.clone()],
                 detect: true,
                 sizing: opts.size_all,
+                foreign: false,
             }],
             pending: 1,
             done: false,
@@ -301,6 +304,7 @@ fn process(sh: &Shared, item: Item) {
         }
     }
 
+    let foreign = item.foreign;
     let mut accs = item.accs;
     let mut detect = item.detect;
     let mut sizing = item.sizing;
@@ -345,6 +349,7 @@ fn process(sh: &Shared, item: Item) {
             let mut caccs = accs.clone();
             let mut cdetect = detect;
             let mut csizing = sizing;
+            let mut cforeign = foreign;
             if detect {
                 if let Some(h) = sh.cls.child_dir(&path, &name, &names) {
                     let a = Arc::new(Acc::default());
@@ -377,9 +382,19 @@ fn process(sh: &Shared, item: Item) {
                         sh.out.lock().unwrap().skipped.push(path);
                         continue;
                     }
-                    Ok(m) => caccs
-                        .iter()
-                        .for_each(|a| a.add(platform::alloc(&m), platform::mtime(&m))),
+                    Ok(m) => {
+                        // Full scan: the outermost directory another user (root, a container's
+                        // uid) owns. We cannot remove it, so a human must hear about it.
+                        if sh.size_all && !foreign && !platform::owned_by_me(&m) {
+                            let a = Arc::new(Acc::default());
+                            sh.out.lock().unwrap().found.push((path.clone(), "other-owner", a.clone(), true));
+                            caccs.push(a);
+                            cforeign = true;
+                        }
+                        caccs
+                            .iter()
+                            .for_each(|a| a.add(platform::alloc(&m), platform::mtime(&m)))
+                    }
                     Err(_) => {
                         sh.errors.fetch_add(1, Relaxed);
                         continue;
@@ -396,6 +411,7 @@ fn process(sh: &Shared, item: Item) {
                 accs: caccs,
                 detect: cdetect,
                 sizing: csizing,
+                foreign: cforeign,
             });
         } else if sizing || (detect && ft.is_file() && sh.cls.file_interest(&name)) {
             let m = match fs::symlink_metadata(&path) {

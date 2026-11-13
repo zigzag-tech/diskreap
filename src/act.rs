@@ -16,6 +16,11 @@ use std::time::Duration;
 
 /// Hang-proof size of one tree (same walker, sizing everything).
 pub fn du(p: &Path, mounts: &[Mount]) -> u64 {
+    du_stats(p, mounts).0
+}
+
+/// (allocated bytes, newest mtime) of one tree, hang-proof.
+pub fn du_stats(p: &Path, mounts: &[Mount]) -> (u64, i64) {
     struct None_;
     impl walk::Classify for None_ {
         fn child_dir(&self, _: &Path, _: &str, _: &[String]) -> Option<walk::DirHit> {
@@ -31,7 +36,12 @@ pub fn du(p: &Path, mounts: &[Mount]) -> u64 {
             None
         }
     }
-    walk::walk(
+    if let Ok(m) = fs::symlink_metadata(p) {
+        if !m.is_dir() {
+            return (platform::alloc(&m), platform::mtime(&m));
+        }
+    }
+    let w = walk::walk(
         Opts {
             root: p.to_path_buf(),
             skip: mounts::below(mounts, p),
@@ -42,8 +52,9 @@ pub fn du(p: &Path, mounts: &[Mount]) -> u64 {
             threads: 16,
         },
         Box::new(None_),
-    )
-    .total
+    );
+    let newest = w.nodes.first().map(|n| n.3).unwrap_or(0);
+    (w.total, newest)
 }
 
 /// rm -rf that stays on one filesystem, never follows symlinks/junctions, and
@@ -78,17 +89,26 @@ fn rm_rec(p: &Path, dev: u64, md: &fs::Metadata) -> std::io::Result<()> {
 
 pub struct TreeStats {
     pub bytes: u64,
+    /// Sum of st_size of every non-directory entry (the offload ledger's `bytes`).
+    pub apparent: u64,
     pub newest: i64,
+    /// Newest last use: file atime counts too (a content store that is only read is in use).
+    pub used: i64,
     /// Contains a socket or FIFO.
     pub special: bool,
+    /// Contains a `.diskreap-keep` file.
+    pub keep: bool,
 }
 
 /// Sequential stats of one modest tree (temp entries), staying on its filesystem.
 pub fn tree_stats(p: &Path) -> TreeStats {
     let mut st = TreeStats {
         bytes: 0,
+        apparent: 0,
         newest: 0,
+        used: 0,
         special: false,
+        keep: false,
     };
     let Ok(m) = fs::symlink_metadata(p) else {
         return st;
@@ -101,7 +121,12 @@ pub fn tree_stats(p: &Path) -> TreeStats {
         };
         st.bytes += platform::alloc(&m);
         st.newest = st.newest.max(platform::mtime(&m));
+        st.used = st.used.max(platform::last_use(&m));
         st.special |= platform::is_special(&m.file_type());
+        if !m.is_dir() {
+            st.apparent += m.len();
+            st.keep |= q.file_name().is_some_and(|n| n == ".diskreap-keep");
+        }
         if m.is_dir() && platform::dev(&m) == dev {
             stack.extend(
                 fs::read_dir(&q)
@@ -126,6 +151,13 @@ pub fn cache_pass(it: &Item, cx: &Ctx, delete: bool) -> CacheResult {
     let c = it.cache.as_ref().unwrap();
     let dir = Path::new(&it.path);
     let mut r = CacheResult { total: 0, bytes: 0 };
+    if c.strat == "whole" {
+        // An unknown app's cache is one unit: aging its files one by one would break a
+        // live content store's pins (plan::check decided the whole dir is unused).
+        r.total = du(dir, cx.mounts);
+        r.bytes = if !delete || remove_tree(dir).is_ok() { r.total } else { 0 };
+        return r;
+    }
     if c.strat == "cmd" {
         r.total = du(dir, cx.mounts);
         if delete {
@@ -402,8 +434,9 @@ fn compress(p: &Path) -> bool {
     }
 }
 
-/// Order of escalation: lossless/regenerable first, whole worktrees last.
-const ORDER: &[&str] = &["docker", "log", "tmp", "build-output", "cache", "worktree"];
+/// Order of escalation: lossless/regenerable first, then what has a copy elsewhere
+/// (offloaded data, a merged worktree's branch); old backups, which have none, last.
+pub const ORDER: &[&str] = &["docker", "log", "tmp", "build-output", "cache", "offloaded", "worktree", "backup"];
 
 pub struct ApplyOpts<'a> {
     pub apply: bool,
@@ -512,7 +545,7 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
             }
             let p = Path::new(&it.path);
             let (action, est, ok) = match it.cat.as_str() {
-                "build-output" | "tmp" => ("delete", it.bytes, !o.apply || remove_tree(p).is_ok()),
+                "build-output" | "tmp" | "backup" | "offloaded" => ("delete", it.bytes, !o.apply || remove_tree(p).is_ok()),
                 "log" => ("compress", it.bytes, !o.apply || compress(p)),
                 "worktree" => ("remove-worktree", it.bytes, !o.apply || remove_wt(p)),
                 "docker" if o.apply => {

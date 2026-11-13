@@ -52,7 +52,7 @@ enum Cmd {
     Clean {
         #[arg(long)]
         apply: bool,
-        /// Only these categories: docker, log, tmp, build-output, cache, worktree.
+        /// Only these categories: docker, log, tmp, build-output, cache, offloaded, worktree, backup.
         #[arg(long = "category", short = 'c')]
         categories: Vec<String>,
         /// Print one JSON result (actions, estimates, measured df gain).
@@ -70,7 +70,8 @@ enum Cmd {
         json: bool,
     },
     /// Timer entry point: if free space is low, quick scan + clean until the
-    /// target is reached, escalating to a full scan if needed.
+    /// target is reached, escalating to a full scan if needed. Exits 3 (and writes
+    /// needs-supervision.json) when $HOME is still critical afterwards.
     Auto {
         #[arg(long)]
         dry_run: bool,
@@ -219,6 +220,7 @@ fn status(hook: bool, json: bool) {
                 "host": util::hostname(), "home": home(), "total_bytes": t, "avail_bytes": a,
                 "level": worst, "home_level": home_level(t, a), "target_avail_bytes": home_target(t),
                 "filesystems": fss, "version": env!("CARGO_PKG_VERSION"),
+                "needs_supervision": read_marker(),
             })
         );
         return;
@@ -292,6 +294,9 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
         home_lvl,
         worst
     );
+    if !dry_run && home_lvl != Level::Critical {
+        clear_marker();
+    }
     // Below the operator floor (min_free_gib) the guard acts at `low` even when the timer
     // is critical-only: that is the point of setting a floor above the built-in thresholds.
     let floor_breached = util::min_free_bytes().is_some_and(|f| a < f.min(t / 2));
@@ -347,12 +352,48 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
         }
     }
     let now_avail = fs_space(&home()).map(|s| s.1).unwrap_or(0);
-    if home_level(t, now_avail) != Level::Ok {
+    let lvl = home_level(t, now_avail);
+    if lvl != Level::Ok {
         println!(
-            "still {:?} after safe cleanup: a human/agent must review `diskreap scan --full -v` (report-only items)",
-            home_level(t, now_avail)
+            "still {lvl:?} after safe cleanup: a human/agent must review `diskreap scan --full -v` (report-only items)"
         );
     }
+    if lvl == Level::Critical {
+        write_marker(lvl, t, now_avail);
+        std::process::exit(3);
+    }
+    clear_marker();
+}
+
+/// `needs-supervision.json`: $HOME is still critical after everything safe was done.
+/// An orchestrator (`status --json` → `needs_supervision`) starts a supervised run for
+/// the host; `since` keeps the first time it was seen, so the age of the problem shows.
+fn marker_path() -> PathBuf {
+    util::state_dir().join("needs-supervision.json")
+}
+
+fn read_marker() -> serde_json::Value {
+    std::fs::read(marker_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn write_marker(level: Level, total: u64, avail: u64) {
+    let t = now();
+    let since = read_marker().get("since").and_then(|v| v.as_i64()).unwrap_or(t);
+    let m = serde_json::json!({
+        "host": util::hostname(), "since": since, "updated": t, "level": level,
+        "avail_bytes": avail, "total_bytes": total, "version": env!("CARGO_PKG_VERSION"),
+    });
+    let tmp = marker_path().with_extension("json.tmp");
+    if std::fs::write(&tmp, m.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, marker_path());
+    }
+}
+
+fn clear_marker() {
+    let _ = std::fs::remove_file(marker_path());
 }
 
 fn print_plan(p: &Plan, verbose: bool) {
@@ -379,7 +420,9 @@ fn print_plan(p: &Plan, verbose: bool) {
         "tmp",
         "build-output",
         "cache",
+        "offloaded",
         "worktree",
+        "backup",
         "report",
     ] {
         if !cats.contains(&cat) || !seen.insert(cat) {

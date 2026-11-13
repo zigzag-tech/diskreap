@@ -5,7 +5,10 @@
 //! - cache        : re-downloadable tool & model caches, pruned by last use.
 //! - worktree     : linked git worktrees that are clean, merged, and idle.
 //! - docker       : build cache and dangling/unused images.
-//! - report-only  : cold large dirs, trash, unmerged worktrees — a human decides.
+//! - backup       : (under pressure) dated backups beyond the newest 3 of their series.
+//! - offloaded    : (under pressure) data the offload ledger says is copied off-host and verified.
+//! - report-only  : cold large dirs, trash, unmerged worktrees, newest backups, live unknown
+//!   app caches, git-ignored data, protected and foreign-owned dirs — a human decides.
 
 use crate::walk::{Classify, DirHit};
 use std::path::Path;
@@ -54,6 +57,14 @@ impl Classify for Rules {
                 size: true,
             });
         }
+        // A directory named *backup*: plan.rs groups its dated entries into series.
+        if name.to_ascii_lowercase().contains("backup") {
+            return Some(DirHit {
+                kind: "backup",
+                prune: false,
+                size: true,
+            });
+        }
         // App-local caches: only the app knows if they re-derive — report, never auto-clean.
         let cachey = name == ".cache"
             || name == "cache"
@@ -92,13 +103,21 @@ impl Classify for Rules {
         }
         // A `.git` FILE marks a linked worktree (or a submodule — filtered later).
         // Quick scan does not size worktrees up front; only eligible ones get sized.
-        entries
-            .iter()
-            .any(|(n, is_dir)| n == ".git" && !is_dir)
-            .then_some(DirHit {
+        if entries.iter().any(|(n, is_dir)| n == ".git" && !is_dir) {
+            return Some(DirHit {
                 kind: "worktree",
                 prune: false,
                 size: !self.quick,
+            });
+        }
+        // A main checkout: the full scan lists its git-ignored data for a human.
+        entries
+            .iter()
+            .any(|(n, is_dir)| n == ".git" && *is_dir)
+            .then_some(DirHit {
+                kind: "repo",
+                prune: false,
+                size: false,
             })
     }
 
@@ -261,8 +280,8 @@ mod tests {
     fn git_file_marks_worktree_git_dir_does_not() {
         let r = Rules { quick: false };
         let p = Path::new("/x");
-        assert!(r.self_dir(p, &[(".git".into(), false)]).is_some());
-        assert!(r.self_dir(p, &[(".git".into(), true)]).is_none());
+        assert_eq!(r.self_dir(p, &[(".git".into(), false)]).unwrap().kind, "worktree");
+        assert_eq!(r.self_dir(p, &[(".git".into(), true)]).unwrap().kind, "repo");
         assert_eq!(
             r.self_dir(p, &[("pyvenv.cfg".into(), false)]).unwrap().kind,
             "build-output"
@@ -274,5 +293,6 @@ mod tests {
             "build-output"
         );
         assert_eq!(r.child_dir(p, "blob-cache", &[]).unwrap().kind, "app-cache");
+        assert_eq!(r.child_dir(p, "DB-Backups", &[]).unwrap().kind, "backup");
     }
 }

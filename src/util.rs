@@ -105,8 +105,20 @@ pub fn which(bin: &str) -> Option<PathBuf> {
 
 /// (total, available-to-user) bytes of the filesystem holding `p` — statvfs /
 /// GetDiskFreeSpaceEx on a local path never touches other mounts.
+///
+/// Test hook: `DISKREAP_TEST_AVAIL_BYTES` makes every filesystem report that many bytes
+/// free, so tests can reach `critical` without filling a real disk. It is announced on
+/// stderr every time, so it can never be silently left on.
 pub fn fs_space(p: &Path) -> Option<(u64, u64)> {
-    crate::platform::fs_space(p)
+    let (t, a) = crate::platform::fs_space(p)?;
+    match std::env::var("DISKREAP_TEST_AVAIL_BYTES").ok().and_then(|v| v.parse().ok()) {
+        Some(fake) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("diskreap: TEST MODE, DISKREAP_TEST_AVAIL_BYTES={fake}"));
+            Some((t, fake))
+        }
+        None => Some((t, a)),
+    }
 }
 
 pub fn hostname() -> String {

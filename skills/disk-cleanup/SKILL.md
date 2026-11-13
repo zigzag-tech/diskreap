@@ -37,8 +37,10 @@ Each category lists what is reclaimable now, plus skipped items with the reason:
   upper bounds: recent cache is kept and image layers may be shared.
 - **log** — `*.log` / `*.log.N` ≥ 500 MB (100 MB critical), unwritten for 24h,
   not open, not tracked by git → compressed with zstd (lossless).
-- **tmp** — your own entries directly under `/tmp`, `/var/tmp`, `$TMPDIR`,
-  untouched 7d (2d critical), not in use, and holding no socket/FIFO.
+- **tmp** — your own entries under `/tmp`, `/var/tmp`, `$TMPDIR`, untouched 7d
+  (2d critical), not in use (open, cwd, or named on a command line), and holding
+  no socket/FIFO. An entry kept for something inside it is split and its entries
+  judged one by one, down to 4 levels below the temp root.
 - **build-output** — regenerable trees: `node_modules`, Cargo `target`, `build`
   (with a project marker), `.dart_tool`, `.gradle`, `.next`/`.nuxt`/…, Python
   virtualenvs (found by `pyvenv.cfg`, any name), `Pods`, tool caches. Only if
@@ -55,8 +57,13 @@ Each category lists what is reclaimable now, plus skipped items with the reason:
   artifacts (an ignored `.env` that differs from the main checkout's keeps it),
   idle ≥ 3d (30d when HEAD is detached — likely a pin), not in use by a process
   or a tmux pane. The branch is kept.
+- **Under pressure only** (level low/critical): unknown `~/.cache/<app>` dirs
+  unused 3d as a whole, dated backups beyond the newest 3 of their series in a
+  `*backup*` dir (`backup`), and data an offload ledger says is verified off-host
+  (`offloaded`).
 - **REPORT ONLY** — never auto-cleaned: app-local caches inside repos, data not
-  modified for 90d+, trash. **A human decides.** Present these to the user with
+  modified for 90d+, trash, the newest 3 backups, live unknown app caches ≥ 1 GiB,
+  and (full scan) git-ignored data, protected paths and root-owned dirs ≥ 1 GiB. **A human decides.** Present these to the user with
   sizes; do not delete them yourself unless the user says which.
 
 Skipped worktrees ("uncommitted changes", "commits not in main") are often
@@ -67,7 +74,7 @@ the biggest remaining items: tell the user; do not discard work.
 ```bash
 diskreap clean                         # dry run: exactly what would happen
 diskreap clean --apply                 # act on the plan (re-verifies each item first)
-diskreap clean --apply -c docker -c build-output   # only some categories (docker log tmp build-output cache worktree)
+diskreap clean --apply -c docker -c build-output   # only some categories (docker log tmp build-output cache offloaded worktree backup)
 ```
 
 The plan expires after 6h — rescan if needed. Every action is appended to
@@ -81,7 +88,8 @@ timer / launchd / cron); routine maintenance is a daily `diskreap auto --min-lev
 or an orchestrator calling `scan`/`clean --json`. `auto` does nothing below its level. When free space drops below 15% or 30 GiB
 (**low**) it runs a quick scan + clean, escalating to a full scan, and stops once
 free space is back above max(20%, 40 GiB). Below 5% or 10 GiB (**critical**) the
-age horizons shorten. Check its log with `journalctl --user -u diskreap` (Linux)
+age horizons shorten. If `$HOME` is still critical afterwards it exits 3 and writes
+`~/.local/state/diskreap/needs-supervision.json` (`status --json` → `needs_supervision`). Check its log with `journalctl --user -u diskreap` (Linux)
 or `~/.local/state/diskreap/auto.log` (macOS).
 
 ## Protecting something

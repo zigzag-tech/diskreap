@@ -47,16 +47,35 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 | Category | What | Gate | Action |
 |---|---|---|---|
 | `docker` | build cache, dangling images, and (critical only) images no container uses, created 7d+ ago | age (24h / 1h) | `docker builder/image prune`; `docker rmi` per unused tag (`image prune -a` silently skips tagged images on the containerd image store) |
-| `tmp` | user-owned entries directly under `/tmp`, `/var/tmp`, `$TMPDIR` | idle ≥ 7d (2d critical), not in use, no socket/FIFO inside (a tmux/ssh-agent rendezvous looks idle) | delete |
+| `tmp` | user-owned entries under `/tmp`, `/var/tmp`, `$TMPDIR`: top level first; an entry kept because of something *inside* it (an open file, a path on a command line, a recent write) is split and its entries judged one by one, down to 4 levels below the temp root (a Claude Code session's entries, `/tmp/claude-<uid>/<project>/<session>/<entry>`). A directory that is itself a process's cwd, or holds a socket, is never split | idle ≥ 7d (2d critical), not in use, no socket/FIFO inside (a tmux/ssh-agent rendezvous looks idle), every directory above it ours and nobody's cwd | delete |
 | `log` | `*.log`, `*.log.N` ≥ 500 MB (100 MB critical) | unwritten 24h, not open, not tracked | zstd (lossless) |
 | `build-output` | any directory carrying a valid `CACHEDIR.TAG` (the cache-tagging standard Cargo, pip and others use; honored even outside git), `node_modules`, Cargo `target`, `build`†, `.dart_tool`, `.gradle`†, `.next`/`.nuxt`/`.svelte-kit`/`.angular`†, Python venvs (by `pyvenv.cfg`), `Pods`†, `.build`†, `.tox`, `.pytest_cache`, … | git-ignored, no tracked files, idle ≥ 3d (1d critical), project not in use, not referenced by a service | delete |
 | `cache` | pip, uv, npm, pnpm, yarn, bun, cargo, go, gradle, maven, pub, conda pkgs, Playwright, Puppeteer, Chrome/Chromium/Firefox, Hugging Face, ModelScope, torch, Android, Xcode, `~/Library/Caches` | last use (file atime) beyond the horizon; files held open are kept; the tool's own prune where one exists | prune |
+| `cache` (unknown app, **under pressure**) | `~/.cache/<app>` with no row in the table above | judged as ONE unit, never file by file (aging a live content store's files breaks its pins): nothing inside used (mtime or file atime) for 3d, nothing in use, not referenced, no socket, no mount | delete the dir |
+| `offloaded` (**under pressure**) | paths in the offload ledger (below) | current size and newest mtime equal the ledger's, not a git repo, not in use, not referenced | delete |
 | `worktree` | linked git worktrees | clean, merged into the main branch (incl. patch-equivalent), not locked, no stash entry naming the branch, no ignored data except build artifacts or files identical to the main checkout's, idle ≥ 3d (30d if HEAD is detached; or `worktree_merged_idle_minutes`, below), not in use, not referenced | `git worktree remove` (branch kept) |
-| report only | app caches inside repos, data unmodified for 90d+, trash | — | listed for a human |
+| `backup` (**under pressure**) | dated entries in a directory named `*backup*` (any case) or its undated subdirectories (two levels), grouped into series by name with stamps stripped (`unchain-20261104-043001.dump` → `unchain#dump`; a stamp is a run of digits and `-_.:` with ≥ 4 digits) | older than the newest 3 of its series (only a sibling at least half its size counts as newer, so a job writing stubs cannot push real backups out), idle ≥ 1d, not in use, not referenced; never inside a git repo or an app's own dir (a dot-dir or an install root) | delete |
+| report only | app caches inside repos, data unmodified for 90d+, trash; the newest 3 backups of a series, undated backups, backup dirs in repos/app dirs; unknown `~/.cache/<app>` ≥ 1 GiB still written or in use; full scan: git-ignored data ≥ 1 GiB in a checkout, `protect_paths` entries ≥ 1 GiB, dirs ≥ 1 GiB owned by another user (root) | — | listed for a human |
 
 † only next to a matching project marker (`Cargo.toml`, `package.json`, `build.gradle`, `Podfile`, `Package.swift`, …).
 
 "In use" covers the cwd, executable, open files and mmapped libraries of every process you can inspect, plus the bind-mount sources of running Docker containers and the cwd of every tmux pane. The tmux check matters because sandboxed agents are often non-dumpable, so `/proc/<pid>/cwd` is unreadable even for your own uid. On macOS this comes from `lsof`. If the snapshot can't be taken, everything counts as in use.
+
+## Tiers
+
+- **Always safe** (any level, horizons by level): `docker`, `log`, `tmp`, `build-output`, the `cache` table, merged clean `worktree`s.
+- **Safe under pressure** (scan level `low` or `critical` only; at `ok` they say `only under disk pressure`): unknown app caches, `backup`s beyond the newest 3, `offloaded` data.
+- **Needs a human** (`report`, never removed; `why` names the rule): see the last row above. Dirty/unmerged worktrees are listed under `WORKTREES NEEDING A HUMAN`.
+
+**Offload ledger.** A tool that copies data off-host appends one JSON object per line to `~/.local/state/diskreap/offloaded.jsonl` *after* verifying the copy:
+
+```json
+{"path": "/home/u/histo-reader-archive", "bytes": 27487790694, "mtime": 1789370235, "remote": "oss://bucket/archive/", "verified_at": 1789371000}
+```
+
+`bytes` is the sum of `st_size` of every non-directory entry (for a file, its size; `find P -type f -printf '%s\n'` summed), `mtime` the newest mtime of any entry, the root included (unix seconds), `remote` non-empty, `verified_at` > 0. The last line for a path wins; malformed lines are ignored with a warning. Anything that changed since (one byte, one touch) is skipped.
+
+**Still critical.** When `auto` ends with `$HOME` still `critical`, it writes `~/.local/state/diskreap/needs-supervision.json` = `{"host","since","updated","level","avail_bytes","total_bytes","version"}` (`since` kept from an earlier marker; unix seconds) and exits **3**. Any non-dry run that finds the level below critical removes it. `status --json` carries it as `"needs_supervision"` (the object, or `null`), for an orchestrator to start a supervised run.
 
 ## Pressure levels
 
@@ -79,7 +98,7 @@ diskreap watches `$HOME`'s filesystem and every temp root (`/tmp`, `/var/tmp`, `
 
 **Worktrees that hold work are reported, never deleted.** `diskreap scan` ends with `WORKTREES NEEDING A HUMAN`: every dirty or unmerged worktree, biggest first, with size, kind, time since last activity, branch, what is wrong, a best-effort owner (a process or tmux pane with that cwd, or the `git worktree lock` reason) and the path, plus a count and total size. `status` repeats the count from the last scan. `clean` (dry run or not) prints why each worktree is removed (`clean, merged into origin/main, idle 3h (needs 2h, worktree_merged_idle_minutes); branch X kept, no process inside`).
 
-`auto` stops as soon as free space is back above 20% of the disk, clamped to [15, 150] GiB. It escalates in this order: Docker, logs, temp dirs, build output, caches, worktrees. It only runs the full scan if the quick plan wasn't enough.
+`auto` stops as soon as free space is back above 20% of the disk, clamped to [15, 150] GiB. It escalates in this order: Docker, logs, temp dirs, build output, caches, offloaded data, worktrees, old backups. It only runs the full scan if the quick plan wasn't enough.
 
 ## Install
 
@@ -98,8 +117,8 @@ On Linux, user timers need lingering to run while you're logged out: `sudo login
 ```bash
 diskreap status                 # free space, level, last plan
 diskreap scan [--full] [-v] [--json] [--level low|critical]
-diskreap clean [--apply] [-c CATEGORY]...
-diskreap auto [--dry-run] [--min-level ok|low|critical]   # schedule `--min-level ok` daily for maintenance
+diskreap clean [--apply] [-c CATEGORY]...   # docker log tmp build-output cache offloaded worktree backup
+diskreap auto [--dry-run] [--min-level ok|low|critical]   # schedule `--min-level ok` daily for maintenance; exit 3 = still critical
 diskreap reap PATH --approval NOTE   # remove one human-approved report-only item
 diskreap status|clean --json          # machine-readable, for orchestrators
 diskreap du [PATH] [--depth N] [--top N]   # hang-proof du
@@ -118,6 +137,8 @@ diskreap du [PATH] [--depth N] [--top N]   # hang-proof du
 cargo test                  # unit tests
 cargo build --release && tests/e2e.sh   # real git repos/worktrees in a throwaway $HOME
 ```
+
+Test hooks (never set them on a real host): `DISKREAP_TMP_ROOTS` (`:`-separated) replaces the temp roots, so the suite never touches the machine's `/tmp`; `DISKREAP_TEST_AVAIL_BYTES` makes every filesystem report that many bytes free (announced on stderr), to reach `critical` without filling a disk.
 
 ## License
 
