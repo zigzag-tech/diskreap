@@ -200,6 +200,9 @@ impl Svc {
         let (total, avail) = fs_space(&home()).unwrap_or((0, 0));
         let level = plan::home_level(total, avail);
         let archive = crate::execute::archive_config();
+        // Benchday's diskreap.host/1 schema is closed (additionalProperties: false): the daemon
+        // refuses a record with an unknown field. Agree any new field with the owner of the
+        // Benchday Disk Cleanup plugin and land it in the schema before adding it here.
         let mut body = json!({
             "state": "present", "machine": self.machine, "version": env!("CARGO_PKG_VERSION"),
             "avail_bytes": avail, "total_bytes": total, "level": level,
