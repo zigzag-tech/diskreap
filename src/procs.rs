@@ -347,6 +347,19 @@ impl Refs {
     /// second form keeps a tool's own registry of checkouts (a release system's source
     /// root) from pointing at a worktree this tool then removes (2026-10-14).
     fn operator_protected(&mut self) {
+        // Protect rules a person made in the Benchday Disk Cleanup plugin
+        // (feedback.rs) count exactly like `protect_paths`, for every command.
+        for (g, rule) in crate::feedback::protect_globs() {
+            let pat = util::expand_tilde(&g);
+            let mut any = false;
+            for m in glob::glob(&pat.to_string_lossy()).into_iter().flatten().flatten() {
+                any = true;
+                self.refs.push((m, format!("protect_paths policy {rule}")));
+            }
+            if !any {
+                self.refs.push((pat, format!("protect_paths policy {rule}")));
+            }
+        }
         let Some(cfg) = util::config_json() else { return };
         let bad = |what: &str| -> ! {
             eprintln!("diskreap: config {what}");

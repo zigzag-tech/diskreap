@@ -5,15 +5,18 @@
 #   ./install.sh --claude-hook   # also add a Claude Code SessionStart hook that
 #                                # warns agents when the disk is low
 #   ./install.sh --no-timer      # binary + skill only
+#   ./install.sh --serve         # also run `diskreap serve` (Benchday Disk Cleanup plugin)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 timer=1
 hook=0
+serve=0
 for a in "$@"; do
   case "$a" in
     --no-timer) timer=0 ;;
     --claude-hook) hook=1 ;;
+    --serve) serve=1 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +66,40 @@ if [ "$timer" = 1 ]; then
       ;;
   esac
   echo "scheduled: diskreap auto, hourly"
+fi
+
+if [ "$serve" = 1 ]; then
+  mkdir -p "$HOME/.local/state/diskreap"
+  case "$(uname -s)" in
+    Linux)
+      ud="$HOME/.config/systemd/user"
+      mkdir -p "$ud"
+      sed "s#@BIN@#$bin#" "$here/deploy/diskreap-serve.service" > "$ud/diskreap-serve.service"
+      systemctl --user daemon-reload
+      systemctl --user enable diskreap-serve.service
+      systemctl --user restart diskreap-serve.service
+      ;;
+    Darwin)
+      plist="$HOME/Library/LaunchAgents/io.github.diskreap.serve.plist"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      sed -e "s#@BIN@#$bin#" -e "s#@HOME@#$HOME#g" "$here/deploy/io.github.diskreap.serve.plist" > "$plist"
+      loaded=0
+      for dom in "gui/$(id -u)" "user/$(id -u)"; do
+        launchctl bootout "$dom" "$plist" 2>/dev/null || true
+        if launchctl bootstrap "$dom" "$plist" 2>/dev/null; then loaded=1; echo "launchd: serve loaded in $dom"; break; fi
+      done
+      if [ "$loaded" = 0 ]; then
+        # No GUI session over SSH: a cron watchdog starts it when it is not running.
+        rm -f "$plist"
+        pkill -f "$bin serve" 2>/dev/null || true
+        line="*/5 * * * * pgrep -f '$bin serve' >/dev/null || nohup $bin serve >> $HOME/.local/state/diskreap/serve.log 2>&1 &"
+        { crontab -l 2>/dev/null | grep -v 'diskreap serve'; echo "$line"; } | crontab -
+        nohup "$bin" serve >> "$HOME/.local/state/diskreap/serve.log" 2>&1 &
+        echo "launchd unavailable (no GUI session) — serve kept alive by a crontab watchdog"
+      fi
+      ;;
+  esac
+  echo "serving: diskreap serve (Benchday Disk Cleanup plugin)"
 fi
 
 if [ "$hook" = 1 ]; then

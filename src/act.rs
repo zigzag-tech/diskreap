@@ -649,7 +649,7 @@ fn log(it: &Item, action: &str, note: &str, est_bytes: u64) {
     }));
 }
 
-fn append_log(line: &serde_json::Value) {
+pub(crate) fn append_log(line: &serde_json::Value) {
     if let Ok(mut f) = fs::OpenOptions::new()
         .create(true)
         .append(true)

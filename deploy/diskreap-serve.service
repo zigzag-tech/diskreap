@@ -1,0 +1,15 @@
+[Unit]
+Description=diskreap serve: supervised cleanups for the Benchday Disk Cleanup plugin
+# Talks to the Benchday daemon's local ingress socket; reconnects on its own when the
+# daemon restarts, so no ordering dependency is needed.
+
+[Service]
+ExecStart=@BIN@ serve
+Restart=always
+RestartSec=10
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target

@@ -127,6 +127,52 @@ diskreap du [PATH] [--depth N] [--top N]   # hang-proof du
 - **State:** `~/.local/state/diskreap/`. It holds `plan.json` and `actions.jsonl`, an append-only audit log of everything that was compressed, pruned or removed. Per-item `est_bytes` are logical sizes. Each run's `run-summary` line holds the measured `df` gain, which on btrfs/ZFS keeps growing for a while after the run.
 - **Protect a directory:** put an empty `.diskreap-keep` file in it.
 
+## Supervised cleanups from Benchday (`diskreap serve`)
+
+`diskreap serve` makes this host's diskreap a service of the
+[Benchday](https://benchday.app) **Disk Cleanup** plugin: a person picks a machine,
+gives instructions, watches candidates stream in, decides and comments per item,
+confirms, and diskreap executes with progress and before/after free space. Install
+it with `./install.sh --serve` (a systemd user service / launchd agent). It talks
+only to the Benchday daemon's local socket (`~/.local/state/benchday-daemon/streams-ingress.sock`,
+same user) and reconnects on its own.
+
+- **Instructions only narrow.** Free text ("only caches older than 30d", "never touch
+  ~/archive", "free 25%", "report only") is read by a deterministic parser; clauses it
+  does not understand go to a Harmony LLM router when one answers on
+  `127.0.0.1:8188` (`llm_base_url` in the config; `"llm": false` turns it off) and are
+  otherwise shown back as not understood. An instruction can remove candidates or
+  lower an action; it can never make diskreap consider something its safety floor
+  excludes.
+- **Every candidate** carries size, age, category, a tier (`safe`, `pressure`,
+  `human`, `protected`), a proposed action (`delete` for regenerable data diskreap
+  would clean, `archive` for the rest when a destination is configured, `keep`
+  otherwise), diskreap's reason, regenerable / personal-data / in-use / owner signals,
+  and the last decision and comment for the same path. Photos, video and documents
+  default to `keep` and are never deleted without archive. At most 400 per run.
+- **Nothing changes without a person.** Decisions, rule edits and execution accept only
+  human writers (`user:` principals through the Benchday hub); execution names the
+  digest of the decided set it was shown and is refused if anything changed since.
+  Each item is re-verified right before it is touched (the scanner's own check, or
+  `reap`'s floor), and protect paths, protect rules and `.diskreap-keep` hold however
+  the item got in.
+- **Archive before delete.** `{"archive": {"dest": "cos:bucket/prefix", "script":
+  "~/xc-setup/scripts/offload-verified.sh"}}` in the config: the script copies with
+  checksums, verifies, and removes the source only on zero differences. With no
+  destination an archive is refused, never turned into a delete.
+- **Decisions become policy.** `~/.local/state/diskreap/feedback.jsonl` (2 MiB, rotated
+  once) records every decision and comment; `policy.json` (at most 256 rules) holds
+  rules. "Remember" on a decision creates an enabled rule (`keep` → `protect`); repeated
+  keeps under one directory or in one category suggest a *disabled* learned rule that
+  applies only once enabled. Enabled `protect` rules apply to `scan` and `auto` too.
+  `runs/` keeps the 3 newest runs; `intents.json` the 64 newest requests.
+- **Report-only items from any scan** (the timer, a weekly report pass, `diskreap scan`)
+  appear as the latest run when no supervised run is newer.
+
+Contracts and the plugin live in Benchday (`openspec/changes/disk-cleanup-plugin`).
+Tests: `tests/serve-e2e.py [binary]` drives the real binary against a fake daemon in a
+throwaway `$HOME`.
+
 ## Agent skill
 
 `skills/disk-cleanup/SKILL.md` teaches coding agents (Claude Code, Codex, and others) the two-stage workflow. It also tells them to present report-only items to a human rather than delete them.

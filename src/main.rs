@@ -1,10 +1,17 @@
 mod act;
+mod candidates;
+mod execute;
+mod feedback;
+mod ingress;
+mod instructions;
 mod git;
 mod mounts;
 mod plan;
 mod platform;
 mod procs;
 mod rules;
+mod serve;
+mod sha;
 mod util;
 mod walk;
 
@@ -83,6 +90,10 @@ enum Cmd {
         #[arg(long, default_value = "low")]
         min_level: Level,
     },
+    /// Serve supervised cleanups to Benchday: scans with instructions, a person's
+    /// decisions and comments, confirmed delete/archive, and the rules they teach.
+    /// Runs until stopped (a user service: deploy/diskreap-serve.*).
+    Serve,
     /// Hang-proof `du`: sizes of PATH's subdirectories, skipping other mounts.
     Du {
         path: Option<PathBuf>,
@@ -192,6 +203,7 @@ fn main() {
             force,
             min_level,
         } => auto(dry_run, force, min_level),
+        Cmd::Serve => serve::run(),
         Cmd::Du { path, depth, top } => du(path.unwrap_or_else(home), depth, top),
     }
 }
