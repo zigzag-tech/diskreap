@@ -440,10 +440,13 @@ impl Refs {
     }
 
     /// A service references something at or below `dir`.
+    /// A reference at or below `dir` blocks it. A `protect_paths` entry also blocks
+    /// everything inside it: the operator protected the whole tree, and a backup or log rule
+    /// judges single files (a dump inside a protected backup dir must not go, 2026-11-13).
     pub fn within(&self, dir: &Path) -> Option<&str> {
         self.refs
             .iter()
-            .find(|(p, _)| p.starts_with(dir))
+            .find(|(p, s)| p.starts_with(dir) || (s.starts_with("protect_paths ") && dir.starts_with(p)))
             .map(|(_, s)| s.as_str())
     }
 
@@ -625,7 +628,9 @@ mod protect_tests {
         std::env::remove_var("DISKREAP_CONFIG");
         assert!(r.within(&d.join("wt/keep-1")).is_some());
         assert!(r.within(&d.join("wt/other")).is_none());
+        assert!(r.within(&d.join("wt/keep-1/dump.sql")).is_some(), "inside a protect_paths tree");
         assert!(r.within(Path::new("/reg/src")).is_some());
+        assert!(r.within(Path::new("/reg/src/node_modules")).is_none(), "a config ref protects its path, not its contents");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
