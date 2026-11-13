@@ -3,7 +3,7 @@ Description=diskreap: reclaim disk space when it runs low
 
 [Service]
 Type=oneshot
-ExecStart=@BIN@ auto --min-level critical
+ExecStart=@BIN@ auto --min-level low
 # 3 = still critical after the safe cleanup; needs-supervision.json carries that signal.
 SuccessExitStatus=3
 Nice=19

@@ -228,7 +228,9 @@ expect keepme-recent "skip: branch keepme-recent protected"
 [ "$(jq -r '[.review[] | select(.path|endswith("wt-recent") or endswith("keepme-recent"))] | length' "$T/plan2.json")" = 0 ] && echo "ok    review omits clean merged worktrees" || { echo "FAIL  review: clean listed"; fail=1; }
 DISKREAP_CONFIG="$T/fast.json" "$B" clean -c worktree >"$T/dry.txt"
 grep -q "would remove-worktree.*wt-recent .*branch wt-recent kept" "$T/dry.txt" && echo "ok    dry run says why" || { echo "FAIL  dry run reason"; cat "$T/dry.txt"; fail=1; }
-DISKREAP_CONFIG="$T/fast.json" "$B" scan --level low | grep -q "WORKTREES NEEDING A HUMAN" && echo "ok    scan prints the report section" || { echo "FAIL  report section"; fail=1; }
+# To a file, not a pipe: under pipefail, `grep -q` exiting early breaks diskreap's stdout.
+DISKREAP_CONFIG="$T/fast.json" "$B" scan --level low >"$T/scan-low.txt"
+grep -q "WORKTREES NEEDING A HUMAN" "$T/scan-low.txt" && echo "ok    scan prints the report section" || { echo "FAIL  report section"; fail=1; }
 DISKREAP_CONFIG="$T/fast.json" "$B" clean --apply -c worktree >/dev/null
 gone wt-recent
 kept wt-recentdirty; kept wt-recentahead; kept keepme-recent
@@ -261,4 +263,13 @@ PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=1 "$B" auto --min-level critical >/dev
 rc=0; PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=$((1 << 62)) "$B" auto --min-level critical >/dev/null 2>&1 || rc=$?
 [ "$rc" = 0 ] && [ ! -e "$M" ] && echo "ok    fine again: marker cleared, exit 0" || { echo "FAIL  marker not cleared rc=$rc"; fail=1; }
 [ "$("$B" status --json | jq -c .needs_supervision)" = null ] && echo "ok    status --json needs_supervision null" || { echo "FAIL  status not null"; fail=1; }
+# Keep-above (0.4): at 15% free a big or small disk is low, the hourly guard (--min-level low)
+# acts, escalates to a full scan once, and skips the full scan on the next run within 6 h.
+tot=$("$B" status --json | jq .total_bytes); low=$((tot * 15 / 100))
+[ "$(DISKREAP_TEST_AVAIL_BYTES=$low "$B" status --json 2>/dev/null | jq -r .home_level)" = low ] && echo "ok    15% free is low" || { echo "FAIL  15% not low"; fail=1; }
+rm -f "$T/state/auto-full.stamp"
+o1=$(PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=$low "$B" auto --min-level low 2>&1 || true)
+grep -q '^full scan:' <<<"$o1" && echo "ok    low: auto acts and escalates to a full scan" || { echo "FAIL  low auto did not act: $o1"; fail=1; }
+o2=$(PATH="$T/nobin" DISKREAP_TEST_AVAIL_BYTES=$low "$B" auto --min-level low 2>&1 || true)
+grep -q 'full scan skipped' <<<"$o2" && echo "ok    full scan throttled within 6 h" || { echo "FAIL  full scan not throttled: $o2"; fail=1; }
 exit $fail

@@ -297,8 +297,8 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
     if !dry_run && home_lvl != Level::Critical {
         clear_marker();
     }
-    // Below the operator floor (min_free_gib) the guard acts at `low` even when the timer
-    // is critical-only: that is the point of setting a floor above the built-in thresholds.
+    // Below the operator floor (min_free_gib) `auto` acts at `low` even under
+    // `--min-level critical`: that is the point of setting a floor above the built-in thresholds.
     let floor_breached = util::min_free_bytes().is_some_and(|f| a < f.min(t / 2));
     if worst < min_level && !force && !floor_breached {
         return;
@@ -313,6 +313,16 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
     };
     let target = home_target(t);
     for full in [false, true] {
+        // Keep-above makes `auto` act on every hourly run while a disk stays under 20%; a
+        // big disk that safe cleanup cannot bring back would otherwise get a full walk every
+        // hour. Escalate to the full scan at most every FULL_AUTO_EVERY, unless critical.
+        if full && home_lvl != Level::Critical && !dry_run && !force && full_auto_recent() {
+            println!("full scan skipped: the last one ran under {}h ago", FULL_AUTO_EVERY_SECS / 3600);
+            break;
+        }
+        if full && !dry_run {
+            stamp_full_auto();
+        }
         let plan = plan::scan(&ScanOpts {
             full,
             level: home_lvl,
@@ -363,6 +373,23 @@ fn auto(dry_run: bool, force: bool, min_level: Level) {
         std::process::exit(3);
     }
     clear_marker();
+}
+
+const FULL_AUTO_EVERY_SECS: i64 = 6 * 3600;
+
+fn full_auto_stamp() -> PathBuf {
+    util::state_dir().join("auto-full.stamp")
+}
+
+fn full_auto_recent() -> bool {
+    std::fs::read_to_string(full_auto_stamp())
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .is_some_and(|at| now() - at < FULL_AUTO_EVERY_SECS)
+}
+
+fn stamp_full_auto() {
+    let _ = std::fs::write(full_auto_stamp(), now().to_string());
 }
 
 /// `needs-supervision.json`: $HOME is still critical after everything safe was done.
