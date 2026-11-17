@@ -275,7 +275,7 @@ pub struct Refs {
 }
 
 impl Refs {
-    pub fn collect(home: &Path) -> Refs {
+    pub fn collect(home: &Path, inuse: &InUse) -> Refs {
         let mut files: Vec<PathBuf> = Vec::new();
         let dirs = [
             PathBuf::from("/etc/systemd/system"),
@@ -302,8 +302,59 @@ impl Refs {
         r.config_files(home);
         r.path_commands(home);
         r.operator_protected();
+        let live: Vec<(PathBuf, String)> = inuse.set.iter().map(|p| (p.clone(), "a running process".to_string())).collect();
+        r.local_deps(live, home);
         r.through_links();
         r
+    }
+
+    /// Local packages a serviced or running project loads from elsewhere on disk: npm
+    /// `file:`/`link:` specs in its package.json, and `node_modules` entries that are symlinks
+    /// (how npm installs a `file:` dep and how workspaces link members), followed transitively.
+    /// Node reads a module and closes it, so nothing holds the dependency's files open and
+    /// its node_modules looks like idle build output of an idle project. Missing this deleted
+    /// `hub-core/packages/identity/node_modules` from under attune's launchd server, which
+    /// imports it through `file:../../hub-core/...`: the server ran on what it had already
+    /// loaded and crash-looped on its next restart (2026-11-17).
+    ///
+    /// `live` is (path, why) pairs on top of the service references already collected.
+    fn local_deps(&mut self, live: Vec<(PathBuf, String)>, home: &Path) {
+        let seeds: Vec<(PathBuf, String)> = self.refs.iter().cloned().chain(live).collect();
+        // Every project root at or above a seed. Ancestors are walked once: a dir already seen
+        // had its own ancestors walked then.
+        let mut seen = BTreeSet::new();
+        let mut todo: Vec<(PathBuf, String)> = Vec::new();
+        for (p, src) in seeds {
+            if ["/proc", "/sys", "/dev"].iter().any(|r| p.starts_with(r)) {
+                continue;
+            }
+            // A command line names `attune/../node_modules/.bin/tsx`: walk the real path, so
+            // the project is `unchain` and not `unchain/attune/..`.
+            let p = std::fs::canonicalize(&p).unwrap_or(p);
+            for a in p.ancestors() {
+                if a == home || a.parent().is_none() || !seen.insert(a.to_path_buf()) {
+                    break;
+                }
+                if !in_node_modules(a) && (a.join("package.json").is_file() || a.join("node_modules").is_dir()) {
+                    todo.push((a.to_path_buf(), src.clone()));
+                }
+            }
+        }
+        let mut done = BTreeSet::new();
+        while let Some((proj, src)) = todo.pop() {
+            if !done.insert(proj.clone()) {
+                continue;
+            }
+            for dep in npm_local_deps(&proj) {
+                if dep == home || done.contains(&dep) {
+                    continue;
+                }
+                let why = format!("a local dependency of {} ({src})", proj.display());
+                self.refs.push((dep.join("node_modules"), why.clone()));
+                self.refs.push((dep.clone(), why.clone()));
+                todo.push((dep, why));
+            }
+        }
     }
 
     /// Small text files a service definition names (`Environment=UNITS=/etc/x/units.json`)
@@ -479,6 +530,51 @@ impl Refs {
     }
 }
 
+fn in_node_modules(p: &Path) -> bool {
+    p.components().any(|c| c.as_os_str() == "node_modules")
+}
+
+/// Directories `proj` loads packages from that are not installed copies: `file:`/`link:`
+/// specs in its package.json (resolved against `proj`) and symlinked entries of its
+/// node_modules (`name` or `@scope/name`). Canonical paths; tarballs and dangling links skipped.
+fn npm_local_deps(proj: &Path) -> Vec<PathBuf> {
+    let mut out = BTreeSet::new();
+    let mut add = |p: PathBuf| {
+        if let Ok(real) = std::fs::canonicalize(&p) {
+            if real.is_dir() && !in_node_modules(&real) {
+                out.insert(real);
+            }
+        }
+    };
+    let manifest = std::fs::read_to_string(proj.join("package.json")).ok();
+    if let Some(v) = manifest.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+        for key in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+            for spec in v.get(key).and_then(|d| d.as_object()).into_iter().flat_map(|d| d.values()) {
+                let s = spec.as_str().unwrap_or("");
+                if let Some(rel) = s.strip_prefix("file:").or_else(|| s.strip_prefix("link:")) {
+                    add(proj.join(rel));
+                }
+            }
+        }
+    }
+    let nm = proj.join("node_modules");
+    for e in std::fs::read_dir(&nm).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let scoped = name.to_string_lossy().starts_with('@');
+        let entries: Vec<std::fs::DirEntry> = if scoped {
+            std::fs::read_dir(e.path()).into_iter().flatten().flatten().collect()
+        } else {
+            vec![e]
+        };
+        for e in entries {
+            if e.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                add(e.path());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Every string value under any of `keys`, at any depth of `v`.
 fn collect_keyed(v: &serde_json::Value, keys: &[&str], src: &str, out: &mut Vec<(PathBuf, String)>) {
     match v {
@@ -543,6 +639,39 @@ mod refs_tests {
         r.config_files(Path::new("/nowhere"));
         r.through_links();
         assert!(r.within(&home.join("engine/.venv")).is_some());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_live_projects_local_dependencies_and_theirs_are_protected() {
+        let d = std::env::temp_dir().join(format!("dr-local-deps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let d = { std::fs::create_dir_all(&d).unwrap(); std::fs::canonicalize(&d).unwrap() };
+        let w = |p: &str, s: &str| {
+            let p = d.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, s).unwrap();
+        };
+        // The incident: app/sub is the service's cwd; app imports ../hub/packages/identity by
+        // a file: spec, and identity in turn uses ../lib by one.
+        w("app/package.json", r#"{"dependencies":{"@hub/identity":"file:../hub/packages/identity","t":"file:x.tgz"}}"#);
+        w("app/sub/package.json", "{}");
+        w("hub/packages/identity/package.json", r#"{"dependencies":{"lib":"file:../lib"}}"#);
+        w("hub/packages/identity/node_modules/zod/index.js", "");
+        w("hub/packages/lib/node_modules/x/index.js", "");
+        // A workspace member reached only through a scoped node_modules symlink.
+        w("ws/node_modules/.keep", "");
+        w("member/node_modules/y/index.js", "");
+        std::fs::create_dir_all(d.join("ws/node_modules/@s")).unwrap();
+        std::os::unix::fs::symlink(d.join("member"), d.join("ws/node_modules/@s/member")).unwrap();
+        w("idle/node_modules/z/index.js", "");
+        let mut r = Refs::default();
+        r.local_deps(vec![(d.join("app/sub"), "svc".into()), (d.join("ws/src/main.js"), "a running process".into())], Path::new("/nowhere"));
+        let why = r.within(&d.join("hub/packages/identity/node_modules")).expect("direct file: dep");
+        assert!(why.contains("a local dependency of") && why.contains("(svc)"), "{why}");
+        assert!(r.within(&d.join("hub/packages/lib/node_modules")).is_some(), "transitive");
+        assert!(r.within(&d.join("member/node_modules")).is_some(), "symlinked member");
+        assert!(r.within(&d.join("idle/node_modules")).is_none(), "an unrelated project stays prunable");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
