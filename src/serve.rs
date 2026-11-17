@@ -626,7 +626,7 @@ fn execute_worker(svc: &Arc<Svc>, id: &str, mut run: Run, dry: bool, approval: &
     let archive = crate::execute::archive_config();
     let home = home();
     let inuse = crate::procs::InUse::snapshot();
-    let refs = crate::procs::Refs::collect(&home);
+    let refs = crate::procs::Refs::collect(&home, &inuse);
     let policy = Policy::load();
     let cx = crate::execute::Ctx { plan: plan.as_ref(), archive: archive.as_ref(), approval, apply: !dry, inuse: &inuse, refs: &refs, policy: &policy };
     // Archive first: what has no other copy is safest moved before anything else is touched.

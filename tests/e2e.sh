@@ -51,6 +51,19 @@ touch "$H/svc/venv/pyvenv.cfg"
 mkdir -p "$H/.config/systemd/user"
 printf '[Service]\nExecStart=%s/svc/venv/bin/python -m srv\n' "$H" >"$H/.config/systemd/user/svc.service"
 
+# Regression 2026-11-17: local npm dependencies of a served and of a running project. Node
+# closes what it imports, so only the dependency edge protects them: a `file:` spec of a
+# project a unit names, and a scoped node_modules symlink of a project a process is in.
+for r in hubc libc; do
+  git init -q -b main "$H/$r"; mkdir -p "$H/$r/packages/p"; echo '{}' >"$H/$r/packages/p/package.json"
+  (cd "$H/$r" && printf 'node_modules/\n' >.gitignore && git add . && git commit -qm i)
+  big "$H/$r/packages/p/node_modules/zod/big" 12M
+done
+mkdir -p "$H/srvapp" "$H/liveapp/node_modules/@s"
+printf '{"dependencies":{"@hub/p":"file:../hubc/packages/p"}}\n' >"$H/srvapp/package.json"
+printf '[Service]\nWorkingDirectory=%s/srvapp\nExecStart=/usr/bin/node server.js\n' "$H" >"$H/.config/systemd/user/srvapp.service"
+ln -s "$H/libc/packages/p" "$H/liveapp/node_modules/@s/p"
+
 mkdir -p "$H/plain/node_modules" && big "$H/plain/node_modules/f" 12M
 # An exported (non-git) Cargo tree: target/ declares itself a cache via CACHEDIR.TAG.
 big "$H/exported/daemon/target/release/big" 12M
@@ -121,7 +134,8 @@ sleep 600 <"$T/tmp/sess/live/blob" &
 sleep 600 <"$T/tmp/claude-1000/proj/sess/live.txt" &
 sleep 600 <"$T/tmp/deep/a/b/c/live" &
 sleep 600 <"$H/.cache/liveapp/pins/blob" &
-bash -c 'sleep 600; :' x "--import=$T/tmp/sess2/mod/x.mjs" &   # `; :` stops bash exec-ing sleep (losing argv)
+bash -c 'sleep 600; :' x "--import=$T/tmp/sess2/mod/x.mjs" &
+(cd "$H/liveapp" && exec sleep 600) &   # only its cwd is held   # `; :` stops bash exec-ing sleep (losing argv)
 sleep 0.5
 DISKREAP_DEBUG=1 "$B" scan --level low --json >"$T/plan.json" 2>"$T/scan.err"
 v() { local p="$1"; [[ "$p" == /* ]] || p="$H/$p"; jq -r --arg p "$p" '.items[] | select(.path==$p) | if .ok then "ok" else "skip: " + .why end' "${PLAN:-$T/plan.json}"; }
@@ -142,6 +156,8 @@ expect wt-envsame ok
 expect wt-detached ok # 60d idle > 30d pin horizon
 expect wt-recent "skip: active"   # no worktree_merged_idle_minutes configured: the 3d rule holds
 expect svc/venv "skip: project referenced by"
+expect hubc/packages/p/node_modules "skip: project referenced by a local dependency of $H/srvapp"
+expect libc/packages/p/node_modules "skip: project referenced by a local dependency of $H/liveapp"
 expect plain/node_modules "skip: no project manifest"
 expect .local/share/uv/tools/ytdl "skip: inside an installation root"
 expect apps/tool/venv "skip: no project manifest"
@@ -200,6 +216,7 @@ kept wt-unmerged
 kept wt-stashed
 kept wt-envdiff/.env
 kept svc/venv
+kept hubc/packages/p/node_modules; kept libc/packages/p/node_modules
 kept .local/share/uv/tools/ytdl
 kept apps/tool/venv
 kept active/target

@@ -1024,7 +1024,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
     );
     mark("walk");
     let inuse = InUse::snapshot();
-    let refs = Refs::collect(&home);
+    let refs = Refs::collect(&home, &inuse);
     let cx = Ctx {
         tmp_idle_days: tmp_idle_days(o.level),
         home: &home,

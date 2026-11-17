@@ -475,7 +475,7 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
     let home = Path::new(&plan.home).to_path_buf();
     let mounts = mounts::list();
     let inuse = InUse::snapshot();
-    let refs = Refs::collect(&home);
+    let refs = Refs::collect(&home, &inuse);
     // Operator protections are read live: editing the config between scan and clean applies.
     let policy = plan.policy.clone().with_operator_config();
     let cx = Ctx {
@@ -597,10 +597,11 @@ pub fn reap_approved(path: &Path, approval: &str) -> Result<u64, String> {
             "is a git repository/worktree: remove it with git after checking its work".into(),
         );
     }
-    if let Some(h) = InUse::snapshot().under(&p) {
+    let inuse = InUse::snapshot();
+    if let Some(h) = inuse.under(&p) {
         return Err(format!("in use ({})", h.display()));
     }
-    if let Some(src) = Refs::collect(&home).within(&p) {
+    if let Some(src) = Refs::collect(&home, &inuse).within(&p) {
         return Err(format!("referenced by {src}"));
     }
     if approval.trim().is_empty() {
