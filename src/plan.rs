@@ -4,6 +4,7 @@
 use crate::act;
 use crate::git;
 use crate::mounts::{self, Mount};
+use crate::spool;
 use crate::procs::{InUse, Owners, Refs};
 use crate::rules::{is_log, Rules, Strat, CACHES, REPORT_ONLY};
 use crate::util::{self, fs_space, now, which, DAY, GB};
@@ -523,6 +524,7 @@ pub fn check(it: &Item, cx: &Ctx) -> Result<(), String> {
         "docker" => which("docker")
             .map(|_| ())
             .ok_or_else(|| "docker not installed".into()),
+        "agent-spool" => agent_spool(p, cx),
         "backup" => old_backup(p, cx),
         "offloaded" => offloaded(p, cx),
         _ => Err("report only".into()),
@@ -582,6 +584,21 @@ fn unknown_cache(p: &Path, days: i64, cx: &Ctx) -> Result<(), String> {
     unused(p, &st, cx)?;
     idle(now(), st.used, days)?;
     pressure(cx.policy)
+}
+
+/// An agent state dir (see `spool`): still that layout, under the XDG state root, not kept.
+/// Each unit inside is judged again by `spool::pass` at the moment it would go.
+fn agent_spool(p: &Path, cx: &Ctx) -> Result<(), String> {
+    if !p.starts_with(spool::state_root(cx.home)) {
+        return Err("not under the XDG state dir".into());
+    }
+    if !spool::is_agent_state_dir(p) {
+        return Err("no longer an agent state dir".into());
+    }
+    if keep_marked(p, cx.home) {
+        return Err("protected by .diskreap-keep".into());
+    }
+    Ok(())
 }
 
 fn is_backup_dir(p: &Path) -> bool {
@@ -1276,6 +1293,35 @@ pub fn scan(o: &ScanOpts) -> Plan {
         items.push(it);
     }
 
+    // Agent session artifacts: spooled tool output, trimmed history, checkpoints and per-run
+    // temp files in agents' XDG state dirs, each past its own horizon.
+    for d in spool::agent_state_dirs(&spool::state_root(&home), &mounts) {
+        let mut it = item("agent-spool", &d, 0, 0);
+        verdict(&mut it, &cx);
+        if it.ok {
+            let r = spool::pass(&d, &cx, false);
+            it.bytes = r.bytes;
+            it.ok = r.bytes > 0;
+            it.why = if it.ok {
+                format!(
+                    "{} idle > {}d/{}d ({} total)",
+                    r.summary(),
+                    spool::SPOOL_IDLE_DAYS,
+                    spool::RUN_TEMP_IDLE_DAYS,
+                    util::human(r.total)
+                )
+            } else {
+                format!(
+                    "{} total, nothing idle > {}d (spools) / {}d (per-run temp)",
+                    util::human(r.total),
+                    spool::SPOOL_IDLE_DAYS,
+                    spool::RUN_TEMP_IDLE_DAYS
+                )
+            };
+        }
+        items.push(it);
+    }
+
     // Offloaded: the ledger's paths, still exactly as they were copied.
     for r in offload_ledger(true) {
         let p = util::expand_tilde(&r.path);
@@ -1335,7 +1381,7 @@ pub fn scan(o: &ScanOpts) -> Plan {
     // Keep plans small: tiny skips are noise.
     let debug = std::env::var_os("DISKREAP_DEBUG").is_some();
     items.retain(|i| {
-        debug || i.ok || i.bytes >= 100 << 20 || i.cat == "docker" || i.cat == "worktree"
+        debug || i.ok || i.bytes >= 100 << 20 || i.cat == "docker" || i.cat == "worktree" || i.cat == "agent-spool"
     });
     items.sort_by(|a, b| b.ok.cmp(&a.ok).then(b.bytes.cmp(&a.bytes)));
 

@@ -436,7 +436,7 @@ fn compress(p: &Path) -> bool {
 
 /// Order of escalation: lossless/regenerable first, then what has a copy elsewhere
 /// (offloaded data, a merged worktree's branch); old backups, which have none, last.
-pub const ORDER: &[&str] = &["docker", "log", "tmp", "build-output", "cache", "offloaded", "worktree", "backup"];
+pub const ORDER: &[&str] = &["docker", "log", "tmp", "agent-spool", "build-output", "cache", "offloaded", "worktree", "backup"];
 
 pub struct ApplyOpts<'a> {
     pub apply: bool,
@@ -462,7 +462,7 @@ pub struct ApplyResult {
 pub struct ActionRecord {
     pub cat: String,
     pub path: String,
-    /// delete | compress | remove-worktree | docker-prune | prune-cache | skip
+    /// delete | compress | remove-worktree | docker-prune | prune-cache | prune-spool | skip
     pub action: String,
     pub est_bytes: u64,
     pub ok: bool,
@@ -553,6 +553,8 @@ pub fn apply(plan: &Plan, o: &ApplyOpts) -> ApplyResult {
                     ("docker-prune", gained, ok)
                 }
                 "docker" => ("docker-prune", it.bytes, true),
+                "agent-spool" if o.apply => ("prune-spool", crate::spool::pass(p, &cx, true).bytes, true),
+                "agent-spool" => ("prune-spool", it.bytes, true),
                 "cache" if o.apply => ("prune-cache", cache_pass(it, &cx, true).bytes, true),
                 "cache" => ("prune-cache", it.bytes, true),
                 _ => continue,
