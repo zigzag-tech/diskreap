@@ -53,7 +53,7 @@ pub fn candidate_id(machine: &str, path: &str) -> String {
 }
 
 fn regenerable(category: &str) -> bool {
-    matches!(category, "docker" | "build-output" | "cache" | "tmp" | "log" | "worktree" | "offloaded")
+    matches!(category, "docker" | "build-output" | "cache" | "tmp" | "agent-spool" | "log" | "worktree" | "offloaded")
 }
 
 const PERSONAL_DIRS: &[&str] = &["pictures", "photos", "dcim", "movies", "music", "documents", "desktop", "相册", "照片"];

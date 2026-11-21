@@ -12,6 +12,7 @@ mod procs;
 mod rules;
 mod serve;
 mod sha;
+mod spool;
 mod util;
 mod walk;
 
@@ -59,7 +60,7 @@ enum Cmd {
     Clean {
         #[arg(long)]
         apply: bool,
-        /// Only these categories: docker, log, tmp, build-output, cache, offloaded, worktree, backup.
+        /// Only these categories: docker, log, tmp, agent-spool, build-output, cache, offloaded, worktree, backup.
         #[arg(long = "category", short = 'c')]
         categories: Vec<String>,
         /// Print one JSON result (actions, estimates, measured df gain).
@@ -462,6 +463,7 @@ fn print_plan(p: &Plan, verbose: bool) {
         "docker",
         "log",
         "tmp",
+        "agent-spool",
         "build-output",
         "cache",
         "offloaded",
