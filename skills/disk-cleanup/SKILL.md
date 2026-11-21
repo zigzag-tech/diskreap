@@ -46,6 +46,10 @@ Each category lists what is reclaimable now, plus skipped items with the reason:
   (2d critical), not in use (open, cwd, or named on a command line), and holding
   no socket/FIFO. An entry kept for something inside it is split and its entries
   judged one by one, down to 4 levels below the temp root.
+- **agent-spool** — coding agents' per-session files in XDG state dirs (found by
+  layout: a `*.sqlite`, `tool-output/` or tool-call spool dir): spooled tool
+  output, `history-*.txt` and `checkpoints/<session>/` idle 30d, and
+  `model-choices-*.json` idle 7d. The conversation database is never touched.
 - **build-output** — regenerable trees: `node_modules`, Cargo `target`, `build`
   (with a project marker), `.dart_tool`, `.gradle`, `.next`/`.nuxt`/…, Python
   virtualenvs (found by `pyvenv.cfg`, any name), `Pods`, tool caches. Only if
@@ -79,7 +83,7 @@ the biggest remaining items: tell the user; do not discard work.
 ```bash
 diskreap clean                         # dry run: exactly what would happen
 diskreap clean --apply                 # act on the plan (re-verifies each item first)
-diskreap clean --apply -c docker -c build-output   # only some categories (docker log tmp build-output cache offloaded worktree backup)
+diskreap clean --apply -c docker -c build-output   # only some categories (docker log tmp agent-spool build-output cache offloaded worktree backup)
 ```
 
 The plan expires after 6h — rescan if needed. Every action is appended to

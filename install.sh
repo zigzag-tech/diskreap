@@ -106,6 +106,9 @@ fi
 if [ "$hook" = 1 ]; then
   settings="$HOME/.claude/settings.json"
   command -v jq >/dev/null || { echo "jq is required for --claude-hook" >&2; exit 1; }
+  # A host without Claude Code yet has no ~/.claude; create it so the hook is
+  # already in place when Claude Code is installed (zz-leaky, 2026-11-21).
+  mkdir -p "$(dirname "$settings")"
   [ -f "$settings" ] || echo '{}' > "$settings"
   # Literal $HOME (the hook runs in a shell): one settings.json can serve
   # machines whose homes differ (/home/x vs /Users/x). Never fail a session.

@@ -11,6 +11,7 @@ H="$T/home"
 mkdir -p "$H"
 mkdir -p "$T/tmp"
 # DISKREAP_TMP_ROOTS: judge (and clean) only our own temp root, never this machine's /tmp.
+unset XDG_STATE_HOME   # agent state dirs are looked for under $HOME/.local/state
 export TMPDIR="$T/tmp" DISKREAP_TMP_ROOTS="$T/tmp" HOME="$H" DISKREAP_STATE="$T/state" GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 big() { mkdir -p "$(dirname "$1")"; head -c "$2" /dev/urandom >"$1"; }
 huge() { mkdir -p "$(dirname "$1")"; fallocate -l "$2" "$1" 2>/dev/null || head -c "$2" /dev/zero >"$1"; }
@@ -105,11 +106,20 @@ for d in 2 3 4; do echo stub >"$H/db-backups/stubs/site-2026110$d.tar"; done
 # Offloaded: one unchanged since its ledger line, one changed.
 big "$H/archive/run1/blob" 11M; big "$H/archive/run2/blob" 11M
 
+# Agent session artifacts in an XDG state dir: old spools and checkpoints go; the database,
+# transcripts and recent spool files stay; per-run temp files have their own 7-day horizon.
+A="$H/.local/state/agentx/rust"
+big "$A/conversations.sqlite" 1M; big "$A/transcript-1.jsonl" 1K
+big "$A/tool-output/call_old.txt" 2M; big "$A/tool-output/call_new.txt" 1K
+big "$A/host-exec/call_1.txt" 1K; big "$A/checkpoints/20720273-fcac-4e86/turns/t1" 1K
+big "$A/model-choices-1.json" 1K; big "$A/model-choices-2.json" 1K
+
 # Age everything 60 days, then make one model recently used.
 chmod -R u+w "$H/repo/artifacts"
 find "$H" "$T/tmp" -mindepth 1 -exec touch -h -a -m -d '60 days ago' {} +
 chmod -R a-w "$H/repo/artifacts/run1/hub"
 touch -a "$H/.cache/huggingface/hub/models--new/w"
+touch -d '2 days ago' "$A/tool-output/call_new.txt"; touch -d '10 days ago' "$A/model-choices-1.json"; touch -d '3 days ago' "$A/model-choices-2.json"
 touch "$H/active/.git/index"   # someone ran git there just now
 for d in 1 2 3 4 5; do touch -d "$((11 - d)) days ago" "$H/db-backups/host1/unchain-2026110$d-043001.dump"; done
 touch -d '10 days ago' "$H/db-backups/stubs/site-20261101.tar"
@@ -197,13 +207,14 @@ sed -i '$d' "$T/state/offloaded.jsonl"
 DISKREAP_DEBUG=1 "$B" scan --level ok --json >"$T/plan-ok.json" 2>/dev/null
 PLAN="$T/plan-ok.json"
 expect .cache/oldapp "skip: only under disk pressure"
+expect .local/state/agentx/rust ok
 expect db-backups/host1/unchain-20261101-043001.dump "skip: only under disk pressure"
 expect archive/run1 "skip: only under disk pressure"
 expect_cat .cache/liveapp "report: unknown app cache, in use"
 unset PLAN
 DISKREAP_DEBUG=1 "$B" scan --level low --json >"$T/plan.json" 2>/dev/null   # clean acts on the last plan
 
-"$B" clean --apply -c build-output -c worktree -c cache -c log -c tmp -c backup -c offloaded >/dev/null 2>&1
+"$B" clean --apply -c build-output -c worktree -c cache -c log -c tmp -c agent-spool -c backup -c offloaded >/dev/null 2>&1
 gone() { if [ -e "$H/$1" ] || { [[ "$1" == /* ]] && [ -e "$1" ]; }; then echo "FAIL  $1 still exists"; fail=1; else echo "ok    $1 removed"; fi; }
 kept() { if [ -e "$H/$1" ]; then echo "ok    $1 kept"; else echo "FAIL  $1 was removed"; fail=1; fi; }
 gone repo/node_modules
@@ -230,6 +241,10 @@ gone .cache/oldapp; kept .cache/liveapp
 gone db-backups/host1/unchain-20261101-043001.dump; gone db-backups/host1/unchain-20261102-043001.dump
 kept db-backups/host1/unchain-20261103-043001.dump; kept db-backups/stubs/site-20261101.tar
 gone archive/run1; kept archive/run2
+gone .local/state/agentx/rust/tool-output/call_old.txt; gone .local/state/agentx/rust/host-exec/call_1.txt
+gone .local/state/agentx/rust/checkpoints/20720273-fcac-4e86; gone .local/state/agentx/rust/model-choices-1.json
+kept .local/state/agentx/rust/conversations.sqlite; kept .local/state/agentx/rust/transcript-1.jsonl
+kept .local/state/agentx/rust/tool-output/call_new.txt; kept .local/state/agentx/rust/model-choices-2.json
 [ -S "$T/tmp/live-session/sock" ] && echo "ok    live-session socket kept" || { echo "FAIL  socket dir removed"; fail=1; }
 git -C "$H/repo" rev-parse -q --verify wt-merged >/dev/null && echo "ok    branch wt-merged kept" || { echo "FAIL  branch deleted"; fail=1; }
 # Fast rule: worktree_merged_idle_minutes + protect_worktree_branches (config file), scan then dry run then apply.

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-pub const CATEGORIES: &[&str] = &["docker", "log", "tmp", "build-output", "cache", "offloaded", "worktree", "backup", "report"];
+pub const CATEGORIES: &[&str] = &["docker", "log", "tmp", "agent-spool", "build-output", "cache", "offloaded", "worktree", "backup", "report"];
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Interp {
@@ -84,6 +84,7 @@ fn category_word(w: &str) -> Option<&'static str> {
         "docker" => "docker",
         "log" | "logs" => "log",
         "tmp" | "temp" | "temporary" => "tmp",
+        "agent-spool" | "spool" | "spools" => "agent-spool",
         "build" | "builds" | "build-output" | "node_modules" | "target" | "artifacts" => "build-output",
         "worktree" | "worktrees" => "worktree",
         "backup" | "backups" => "backup",

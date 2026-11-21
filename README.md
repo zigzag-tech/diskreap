@@ -49,6 +49,7 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 |---|---|---|---|
 | `docker` | build cache, dangling images, and (critical only) images no container uses, created 7d+ ago | age (24h / 1h) | `docker builder/image prune`; `docker rmi` per unused tag (`image prune -a` silently skips tagged images on the containerd image store) |
 | `tmp` | user-owned entries under `/tmp`, `/var/tmp`, `$TMPDIR`: top level first; an entry kept because of something *inside* it (an open file, a path on a command line, a recent write) is split and its entries judged one by one, down to 4 levels below the temp root (a Claude Code session's entries, `/tmp/claude-<uid>/<project>/<session>/<entry>`). A directory that is itself a process's cwd, or holds a socket, is never split | idle ≥ 7d (2d critical), not in use, no socket/FIFO inside (a tmux/ssh-agent rendezvous looks idle), every directory above it ours and nobody's cwd | delete |
+| `agent-spool` | coding agents' per-session artifacts in their XDG state dir (`$XDG_STATE_HOME`, else `~/.local/state`, 4 levels down). A dir is an *agent state dir* by layout, never by app name: it holds a `*.sqlite` file, a `tool-output/` dir, or a dir of tool-call files only (`call_*.txt`, `toolu_*.txt`, `history-*.txt`). Units inside it: every file of those spool dirs, loose `history-*.txt`, each `checkpoints/<session-id>/` as one unit, and `model-choices-*.json` (per-run temp) | newest mtime and file atime older than 30d (spools, history, checkpoints) or 7d (`model-choices-*`), not in use, not referenced, no `.diskreap-keep`; fixed horizons at every level. `*.sqlite*` (the conversation database), transcripts and anything unmatched are never touched | delete |
 | `log` | `*.log`, `*.log.N` ≥ 500 MB (100 MB critical) | unwritten 24h, not open, not tracked | zstd (lossless) |
 | `build-output` | any directory carrying a valid `CACHEDIR.TAG` (the cache-tagging standard Cargo, pip and others use; honored even outside git), `node_modules`, Cargo `target`, `build`†, `.dart_tool`, `.gradle`†, `.next`/`.nuxt`/`.svelte-kit`/`.angular`†, Python venvs (by `pyvenv.cfg`), `Pods`†, `.build`†, `.tox`, `.pytest_cache`, … | git-ignored, no tracked files, idle ≥ 3d (1d critical), project not in use, not referenced by a service | delete |
 | `cache` | pip, uv, npm, pnpm, yarn, bun, cargo, go, gradle, maven, pub, conda pkgs, Playwright, Puppeteer, Chrome/Chromium/Firefox, Hugging Face, ModelScope, torch, Android, Xcode, `~/Library/Caches` | last use (file atime) beyond the horizon; files held open are kept; the tool's own prune where one exists | prune |
@@ -64,7 +65,7 @@ Every rule here comes from cleaning a real 1.8 TB workstation that hit 100% whil
 
 ## Tiers
 
-- **Always safe** (any level, horizons by level): `docker`, `log`, `tmp`, `build-output`, the `cache` table, merged clean `worktree`s.
+- **Always safe** (any level, horizons by level): `docker`, `log`, `tmp`, `agent-spool` (fixed horizons), `build-output`, the `cache` table, merged clean `worktree`s.
 - **Safe under pressure** (scan level `low` or `critical` only; at `ok` they say `only under disk pressure`): unknown app caches, `backup`s beyond the newest 3, `offloaded` data.
 - **Needs a human** (`report`, never removed; `why` names the rule): see the last row above. Dirty/unmerged worktrees are listed under `WORKTREES NEEDING A HUMAN`.
 
@@ -99,7 +100,7 @@ diskreap watches `$HOME`'s filesystem and every temp root (`/tmp`, `/var/tmp`, `
 
 **Worktrees that hold work are reported, never deleted.** `diskreap scan` ends with `WORKTREES NEEDING A HUMAN`: every dirty or unmerged worktree, biggest first, with size, kind, time since last activity, branch, what is wrong, a best-effort owner (a process or tmux pane with that cwd, or the `git worktree lock` reason) and the path, plus a count and total size. `status` repeats the count from the last scan. `clean` (dry run or not) prints why each worktree is removed (`clean, merged into origin/main, idle 3h (needs 2h, worktree_merged_idle_minutes); branch X kept, no process inside`).
 
-**Act below min(15%, 100 GiB), restore 15%.** The installed hourly guard runs `auto --min-level low`: it acts whenever less than min(15% of the disk, 100 GiB) is free (or less than `min_free_gib`): 15% on disks up to ~667 GiB, 100 GiB above that. Once it acts it keeps going until 15% is free again (at least min(15 GiB, 40%); the target has no cap, so a 1.8 TiB disk that drops under 100 GiB climbs back to 270 GiB — a capped target left zz-tower0 at 3% free for weeks). `status` prints both numbers; `status --json` has `low_avail_bytes` and `target_avail_bytes`. It escalates in this order: Docker, logs, temp dirs, build output, caches, offloaded data, worktrees, old backups. It runs the full scan only if the quick plan wasn't enough, and at most every 6 h unless the disk is critical (a disk that safe cleanup cannot bring back would otherwise be walked every hour). What is left is report-only: a person or a supervised run decides about it.
+**Act below min(15%, 100 GiB), restore 15%.** The installed hourly guard runs `auto --min-level low`: it acts whenever less than min(15% of the disk, 100 GiB) is free (or less than `min_free_gib`): 15% on disks up to ~667 GiB, 100 GiB above that. Once it acts it keeps going until 15% is free again (at least min(15 GiB, 40%); the target has no cap, so a 1.8 TiB disk that drops under 100 GiB climbs back to 270 GiB — a capped target left zz-tower0 at 3% free for weeks). `status` prints both numbers; `status --json` has `low_avail_bytes` and `target_avail_bytes`. It escalates in this order: Docker, logs, temp dirs, agent spools, build output, caches, offloaded data, worktrees, old backups. It runs the full scan only if the quick plan wasn't enough, and at most every 6 h unless the disk is critical (a disk that safe cleanup cannot bring back would otherwise be walked every hour). What is left is report-only: a person or a supervised run decides about it.
 
 ## Install
 
@@ -118,7 +119,7 @@ On Linux, user timers need lingering to run while you're logged out: `sudo login
 ```bash
 diskreap status                 # free space, level, last plan
 diskreap scan [--full] [-v] [--json] [--level low|critical]
-diskreap clean [--apply] [-c CATEGORY]...   # docker log tmp build-output cache offloaded worktree backup
+diskreap clean [--apply] [-c CATEGORY]...   # docker log tmp agent-spool build-output cache offloaded worktree backup
 diskreap auto [--dry-run] [--min-level ok|low|critical]   # schedule `--min-level ok` daily for maintenance; exit 3 = still critical
 diskreap reap PATH --approval NOTE   # remove one human-approved report-only item
 diskreap status|clean --json          # machine-readable, for orchestrators

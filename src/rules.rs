@@ -5,6 +5,8 @@
 //! - cache        : re-downloadable tool & model caches, pruned by last use.
 //! - worktree     : linked git worktrees that are clean, merged, and idle.
 //! - docker       : build cache and dangling/unused images.
+//! - agent-spool  : coding agents' per-session spools, checkpoints and per-run temp files in
+//!   XDG state dirs, past their resume horizon (see spool.rs).
 //! - backup       : (under pressure) dated backups beyond the newest 3 of their series.
 //! - offloaded    : (under pressure) data the offload ledger says is copied off-host and verified.
 //! - report-only  : cold large dirs, trash, unmerged worktrees, newest backups, live unknown
