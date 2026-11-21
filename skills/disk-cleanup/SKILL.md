@@ -1,6 +1,11 @@
 ---
 name: disk-cleanup
-description: Free disk space safely with `diskreap` — a hang-proof scanner plus a categorized, re-verifying cleaner. Use when a disk is low/full ("No space left on device", ENOSPC, builds failing on write, a session hook says DISK LOW/CRITICAL), when asked to "clean up disk", "free space", "what's using my disk", "why is the disk full", or before writing large outputs on a nearly full machine. Two stages: scan (quick or full, read-only) → clean (dry run, then --apply).
+description: >-
+  Free disk space safely with `diskreap` — a hang-proof scanner plus a categorized, re-verifying
+  cleaner. Use when a disk is low/full ("No space left on device", ENOSPC, builds failing on
+  write, a session hook says DISK LOW/CRITICAL), when asked to "clean up disk", "free space",
+  "what's using my disk", "why is the disk full", or before writing large outputs on a nearly
+  full machine. Two stages — scan (quick or full, read-only) → clean (dry run, then --apply).
 ---
 
 # Disk cleanup with diskreap
