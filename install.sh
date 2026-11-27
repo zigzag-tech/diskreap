@@ -69,6 +69,16 @@ if [ "$timer" = 1 ]; then
   echo "scheduled: diskreap auto, hourly"
 fi
 
+# A serve installed earlier keeps running the replaced binary until restarted,
+# and a re-run without --serve (a fleet update) would leave it on old code:
+# reinstall and restart it whenever it is already set up here.
+if [ "$serve" = 0 ] && { [ -f "$HOME/.config/systemd/user/diskreap-serve.service" ] ||
+  [ -f "$HOME/Library/LaunchAgents/io.github.diskreap.serve.plist" ] ||
+  crontab -l 2>/dev/null | grep -q 'diskreap serve'; }; then
+  echo "diskreap serve is installed here: restarting it on the new binary"
+  serve=1
+fi
+
 if [ "$serve" = 1 ]; then
   mkdir -p "$HOME/.local/state/diskreap"
   case "$(uname -s)" in
